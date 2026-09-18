@@ -1,20 +1,27 @@
-{
-  "name": "jev-connector",
-  "version": "1.2.0",
-  "private": true,
-  "description": "Secure Jev evaluation connector for the AI Hub",
-  "type": "module",
-  "main": "src/server.js",
-  "scripts": {
-    "start": "node src/server.js",
-    "dev": "node --watch src/server.js"
-  },
-  "engines": {
-    "node": ">=22"
-  },
-  "dependencies": {
-    "ai": "^7.0.105",
-    "cors": "^2.8.5",
-    "express": "^5.1.0"
-  }
-}
+# ------------------------------------------
+# Market Data
+# ------------------------------------------
+
+# Binance USD-M Futures public REST API
+MARKET_DATA_BASE_URL=https://fapi.binance.com
+
+# Binance USD-M Futures public WebSocket
+MARKET_DATA_WS_URL=wss://fstream.binance.com/stream
+
+
+# ------------------------------------------
+# Trader Safety
+# ------------------------------------------
+
+# PAPER is the default.
+# Never change to LIVE until the complete
+# execution and risk system has been tested.
+TRADING_MODE=PAPER
+
+# Must remain false until live trading is
+# deliberately enabled.
+LIVE_TRADING_ENABLED=false
+
+# Emergency kill switch.
+# true = immediately block trading.
+TRADING_KILL_SWITCH=false
