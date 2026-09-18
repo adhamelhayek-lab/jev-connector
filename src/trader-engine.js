@@ -61,14 +61,23 @@ const DEFAULT_POLICY = Object.freeze({
   maxDailyAccumulationEntries: 1,
 
   // Explicit DCA controls.
-  // DCA is restricted to BTCUSDT long-term accumulation.
-  // A fresh FLAT entry is never DCA.
-  dcaEnabled: true,
-  dcaSymbol: "BTCUSDT",
-  dcaLongOnly: true,
-  dcaNotionalFraction: 0.25,
-  maxDcaNotional: 25,
-  minDcaDistanceBps: 100,
+// DCA is restricted to BTCUSDT long-term accumulation.
+// A fresh FLAT entry is never DCA.
+dcaEnabled: true,
+dcaSymbol: "BTCUSDT",
+dcaLongOnly: true,
+dcaNotionalFraction: 0.25,
+maxDcaNotional: 25,
+minDcaDistanceBps: 100,
+
+// Automatic BTC DCA entry controls.
+dcaEntryEnabled: true,
+dcaEntryMode: "JEV_OR_COPY",
+dcaInitialNotional: 25,
+dcaCopySignalEnabled: true,
+dcaCopySignalMaxAgeSeconds: 120,
+dcaCopyMinConfidence: 0.6,
+dcaPriceCheckRequired: true,
 
   // BTC accumulation is long-term and must be exited manually.
   // Jev must never auto-EXIT or auto-REDUCE this accumulation.
