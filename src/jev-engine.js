@@ -1,13 +1,10 @@
 // ============================================================
 // JEV CONNECTOR
-// TRADING EVALUATION ENGINE V3.1
+// TRADING EVALUATION ENGINE V3.2
 // ============================================================
 //
 // Provider:
-//   OpenRouter Decisions API
-//
-// Model:
-//   TypeSafe Jev 1.13
+//   OpenRouter / TypeSafe Jev
 //
 // Purpose:
 //   - Evaluate real-market state
@@ -18,7 +15,7 @@
 //   - Evaluate accumulation conditions
 //   - Detect thesis invalidation
 //   - Evaluate reversal risk
-//   - Preserve Jev probabilities and confidence
+//   - Preserve Jev probabilities, scores and confidence
 //
 // SECURITY BOUNDARY
 // -----------------
@@ -32,7 +29,7 @@
 //   - overrides the Trader risk engine
 //
 // Jev evaluates.
-// Other modules decide whether execution is permitted.
+// Trader Risk Engine decides whether execution is permitted.
 //
 // ============================================================
 
@@ -42,6 +39,7 @@
 // ============================================================
 
 const OPENROUTER_URL =
+  process.env.JEV_DECISIONS_URL ||
   "https://openrouter.ai/api/alpha/decisions";
 
 const JEV_MODEL =
@@ -52,13 +50,22 @@ const ENGINE_NAME =
   "Jev Trading Evaluation Engine";
 
 const ENGINE_VERSION =
-  "3.1.0";
+  "3.2.0";
 
 const REQUEST_TIMEOUT_MS =
-  20_000;
+  Number.isFinite(Number(process.env.JEV_TIMEOUT_MS))
+    ? Math.max(1_000, Math.min(60_000, Number(process.env.JEV_TIMEOUT_MS)))
+    : 20_000;
 
 const MAX_STATE_BYTES =
-  900_000;
+  Number.isFinite(Number(process.env.JEV_MAX_STATE_BYTES))
+    ? Math.max(10_000, Math.min(5_000_000, Number(process.env.JEV_MAX_STATE_BYTES)))
+    : 900_000;
+
+const MAX_RESPONSE_BYTES =
+  Number.isFinite(Number(process.env.JEV_MAX_RESPONSE_BYTES))
+    ? Math.max(10_000, Math.min(5_000_000, Number(process.env.JEV_MAX_RESPONSE_BYTES)))
+    : 2_000_000;
 
 
 // ============================================================
@@ -82,6 +89,19 @@ const VALID_DECISIONS =
     "WAIT"
   ]);
 
+const DIRECTIONAL_DECISIONS =
+  new Set([
+    "LONG",
+    "SHORT"
+  ]);
+
+const POSITION_MANAGEMENT_DECISIONS =
+  new Set([
+    "HOLD",
+    "REDUCE",
+    "EXIT"
+  ]);
+
 
 // ============================================================
 // BASIC HELPERS
@@ -96,11 +116,16 @@ function isObject(value) {
 }
 
 
+function isFiniteNumber(value) {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value)
+  );
+}
+
+
 function clamp01(value) {
-  if (
-    typeof value !== "number" ||
-    !Number.isFinite(value)
-  ) {
+  if (!isFiniteNumber(value)) {
     return null;
   }
 
@@ -112,14 +137,91 @@ function clamp01(value) {
 
 
 function safeNumber(value) {
-  if (
-    typeof value !== "number" ||
-    !Number.isFinite(value)
-  ) {
+  if (!isFiniteNumber(value)) {
     return null;
   }
 
   return value;
+}
+
+
+function safeInteger(value, fallback = null) {
+  if (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    Number.isSafeInteger(value)
+  ) {
+    return value;
+  }
+
+  return fallback;
+}
+
+
+function normalizeString(value, fallback = null) {
+  if (typeof value !== "string") {
+    return fallback;
+  }
+
+  const trimmed = value.trim();
+
+  return trimmed.length > 0
+    ? trimmed
+    : fallback;
+}
+
+
+function safeIsoTimestamp(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const timestamp = Date.parse(value);
+
+  if (!Number.isFinite(timestamp)) {
+    return null;
+  }
+
+  return new Date(timestamp).toISOString();
+}
+
+
+function createRequestId() {
+  try {
+    if (
+      globalThis.crypto &&
+      typeof globalThis.crypto.randomUUID === "function"
+    ) {
+      return globalThis.crypto.randomUUID();
+    }
+  } catch {
+    // Fall through to timestamp-based identifier.
+  }
+
+  return `jev-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+
+function byteLength(value) {
+  try {
+    return Buffer.byteLength(
+      value,
+      "utf8"
+    );
+  } catch {
+    return new TextEncoder().encode(value).length;
+  }
+}
+
+
+function serializeJson(value, label) {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    throw new Error(
+      `${label} cannot be serialized`
+    );
+  }
 }
 
 
@@ -137,10 +239,8 @@ function validateState(state) {
     );
   }
 
-
   const stateType =
     typeof state;
-
 
   if (
     stateType !== "object" &&
@@ -151,28 +251,25 @@ function validateState(state) {
     );
   }
 
-
-  let serialized;
-
-  try {
-    serialized =
-      JSON.stringify(state);
-  } catch {
-    throw new Error(
-      "Market state cannot be serialized"
+  const serialized =
+    serializeJson(
+      state,
+      "Market state"
     );
-  }
-
 
   if (
-    typeof serialized === "string" &&
-    Buffer.byteLength(
-      serialized,
-      "utf8"
-    ) > MAX_STATE_BYTES
+    byteLength(serialized) > MAX_STATE_BYTES
   ) {
     throw new Error(
       "Market state is too large for Jev evaluation"
+    );
+  }
+
+  if (
+    serialized === undefined
+  ) {
+    throw new Error(
+      "Market state produced no JSON payload"
     );
   }
 }
@@ -183,7 +280,6 @@ function validateState(state) {
 // ============================================================
 
 function normalizePosition(state) {
-
   const emptyPosition = {
     side: "FLAT",
     size: null,
@@ -193,78 +289,56 @@ function normalizePosition(state) {
     leverage: null
   };
 
-
-  if (
-    !isObject(state)
-  ) {
+  if (!isObject(state)) {
     return emptyPosition;
   }
 
-
-  if (
-    !isObject(state.position)
-  ) {
+  if (!isObject(state.position)) {
     return emptyPosition;
   }
-
 
   const position =
     state.position;
 
-
   const rawSide =
     typeof position.side === "string"
-      ? position.side.toUpperCase()
+      ? position.side.trim().toUpperCase()
       : "FLAT";
 
-
-  return {
-
+  const normalized = {
     side:
       VALID_POSITION_SIDES.has(rawSide)
         ? rawSide
         : "FLAT",
 
     size:
-      position.size ?? null,
+      safeNumber(position.size),
 
     entryPrice:
-      position.entryPrice ?? null,
+      safeNumber(position.entryPrice),
 
     markPrice:
-      position.markPrice ?? null,
+      safeNumber(position.markPrice),
 
     unrealizedPnl:
-      position.unrealizedPnl ?? null,
+      safeNumber(position.unrealizedPnl),
 
     leverage:
-      position.leverage ?? null
+      safeNumber(position.leverage)
   };
+
+  return normalized;
 }
 
 
 // ============================================================
 // QUESTION DEFINITIONS
 // ============================================================
-//
-// OpenRouter's native Jev Decisions API uses:
-//
-//   noul    -> yes/no probability
-//   choice  -> selected option + probability distribution
-//   score   -> ordered numerical score + distribution
-//
-// ============================================================
 
 function buildQuestions() {
-
   return {
 
-    // --------------------------------------------------------
-    // DIRECTION
-    // --------------------------------------------------------
-
     direction: {
-
       type: "choice",
 
       instructions:
@@ -276,7 +350,6 @@ function buildQuestions() {
         "trade when evidence is insufficient.",
 
       criteria: {
-
         LONG:
           "Evidence supports a bullish directional setup or continuation " +
           "that could justify long exposure.",
@@ -305,13 +378,7 @@ function buildQuestions() {
       }
     },
 
-
-    // --------------------------------------------------------
-    // ACCUMULATION
-    // --------------------------------------------------------
-
     accumulation: {
-
       type: "noul",
 
       instructions:
@@ -322,13 +389,7 @@ function buildQuestions() {
         "exposure, invalidation and risk information."
     },
 
-
-    // --------------------------------------------------------
-    // BULLISH STRUCTURE
-    // --------------------------------------------------------
-
     bullishStructure: {
-
       type: "noul",
 
       instructions:
@@ -336,13 +397,7 @@ function buildQuestions() {
         "market structure."
     },
 
-
-    // --------------------------------------------------------
-    // BEARISH STRUCTURE
-    // --------------------------------------------------------
-
     bearishStructure: {
-
       type: "noul",
 
       instructions:
@@ -350,13 +405,7 @@ function buildQuestions() {
         "market structure."
     },
 
-
-    // --------------------------------------------------------
-    // EVIDENCE
-    // --------------------------------------------------------
-
     sufficientEvidence: {
-
       type: "noul",
 
       instructions:
@@ -365,13 +414,7 @@ function buildQuestions() {
         "evaluation. Missing or stale information should reduce confidence."
     },
 
-
-    // --------------------------------------------------------
-    // RISK
-    // --------------------------------------------------------
-
     riskCompatible: {
-
       type: "noul",
 
       instructions:
@@ -380,13 +423,7 @@ function buildQuestions() {
         "essential risk information must not be treated as acceptable risk."
     },
 
-
-    // --------------------------------------------------------
-    // SETUP QUALITY
-    // --------------------------------------------------------
-
     setupQuality: {
-
       type: "score",
 
       instructions:
@@ -405,13 +442,7 @@ function buildQuestions() {
       ]
     },
 
-
-    // --------------------------------------------------------
-    // ACCUMULATION QUALITY
-    // --------------------------------------------------------
-
     accumulationQuality: {
-
       type: "score",
 
       instructions:
@@ -428,13 +459,7 @@ function buildQuestions() {
       ]
     },
 
-
-    // --------------------------------------------------------
-    // THESIS INVALIDATION
-    // --------------------------------------------------------
-
     thesisInvalidated: {
-
       type: "noul",
 
       instructions:
@@ -442,13 +467,7 @@ function buildQuestions() {
         "invalidated by the supplied market state."
     },
 
-
-    // --------------------------------------------------------
-    // REVERSAL RISK
-    // --------------------------------------------------------
-
     reversalRisk: {
-
       type: "score",
 
       instructions:
@@ -472,43 +491,52 @@ function buildQuestions() {
 // ============================================================
 
 function parseNoul(answer) {
-
-  if (
-    !isObject(answer)
-  ) {
+  if (!isObject(answer)) {
     return null;
   }
 
-
-  // Native OpenRouter / Jev field.
-  if (
-    typeof answer.noul === "number"
-  ) {
-    return clamp01(
-      answer.noul
-    );
+  if (typeof answer.noul === "number") {
+    return clamp01(answer.noul);
   }
 
-
-  // Compatibility with other Jev adapters.
-  if (
-    typeof answer.probability === "number"
-  ) {
-    return clamp01(
-      answer.probability
-    );
+  if (typeof answer.probability === "number") {
+    return clamp01(answer.probability);
   }
 
+  if (typeof answer.value === "number") {
+    return clamp01(answer.value);
+  }
 
   return null;
 }
 
 
-function parseChoice(answer) {
+function normalizeProbabilityMap(probabilities) {
+  if (!isObject(probabilities)) {
+    return {};
+  }
 
-  if (
-    !isObject(answer)
-  ) {
+  const output = {};
+
+  for (const [key, value] of Object.entries(probabilities)) {
+    const probability =
+      clamp01(
+        typeof value === "number"
+          ? value
+          : null
+      );
+
+    if (probability !== null) {
+      output[key] = probability;
+    }
+  }
+
+  return output;
+}
+
+
+function parseChoice(answer) {
+  if (!isObject(answer)) {
     return {
       choice: null,
       probabilities: {},
@@ -516,18 +544,20 @@ function parseChoice(answer) {
     };
   }
 
-
   const probabilities =
-    isObject(answer.probabilities)
-      ? answer.probabilities
-      : {};
+    normalizeProbabilityMap(
+      answer.probabilities
+    );
 
+  const rawChoice =
+    normalizeString(
+      answer.choice
+    );
 
   return {
-
     choice:
-      typeof answer.choice === "string"
-        ? answer.choice
+      rawChoice
+        ? rawChoice.toUpperCase()
         : null,
 
     probabilities,
@@ -541,10 +571,7 @@ function parseChoice(answer) {
 
 
 function parseScore(answer) {
-
-  if (
-    !isObject(answer)
-  ) {
+  if (!isObject(answer)) {
     return {
       score: null,
       probabilities: {},
@@ -552,15 +579,12 @@ function parseScore(answer) {
     };
   }
 
-
   const probabilities =
-    isObject(answer.probabilities)
-      ? answer.probabilities
-      : {};
-
+    normalizeProbabilityMap(
+      answer.probabilities
+    );
 
   return {
-
     score:
       safeNumber(
         answer.score
@@ -581,75 +605,61 @@ function parseScore(answer) {
 // ============================================================
 
 function normalizeAnswers(answers) {
-
-  if (
-    !isObject(answers)
-  ) {
+  if (!isObject(answers)) {
     throw new Error(
       "Jev response contains no valid answers object"
     );
   }
-
 
   const direction =
     parseChoice(
       answers.direction
     );
 
-
   const accumulation =
     parseNoul(
       answers.accumulation
     );
-
 
   const bullishStructure =
     parseNoul(
       answers.bullishStructure
     );
 
-
   const bearishStructure =
     parseNoul(
       answers.bearishStructure
     );
-
 
   const sufficientEvidence =
     parseNoul(
       answers.sufficientEvidence
     );
 
-
   const riskCompatible =
     parseNoul(
       answers.riskCompatible
     );
-
 
   const thesisInvalidated =
     parseNoul(
       answers.thesisInvalidated
     );
 
-
   const setupQuality =
     parseScore(
       answers.setupQuality
     );
-
 
   const accumulationQuality =
     parseScore(
       answers.accumulationQuality
     );
 
-
   const reversalRisk =
     parseScore(
       answers.reversalRisk
     );
-
 
   const selectedDirection =
     VALID_DECISIONS.has(
@@ -658,11 +668,8 @@ function normalizeAnswers(answers) {
       ? direction.choice
       : "WAIT";
 
-
   return {
-
     direction: {
-
       choice:
         selectedDirection,
 
@@ -673,25 +680,16 @@ function normalizeAnswers(answers) {
         direction.confidence
     },
 
-
     probabilities: {
-
       accumulation,
-
       bullishStructure,
-
       bearishStructure,
-
       sufficientEvidence,
-
       riskCompatible,
-
       thesisInvalidated
     },
 
-
     scores: {
-
       setupQuality:
         setupQuality.score,
 
@@ -702,9 +700,7 @@ function normalizeAnswers(answers) {
         reversalRisk.score
     },
 
-
     confidence: {
-
       direction:
         direction.confidence,
 
@@ -718,9 +714,7 @@ function normalizeAnswers(answers) {
         reversalRisk.confidence
     },
 
-
     probabilityDistributions: {
-
       direction:
         direction.probabilities,
 
@@ -745,181 +739,218 @@ function analyzeConsistency(
   decision,
   position
 ) {
-
   const warnings = [];
+  const hardWarnings = [];
 
+  const selected =
+    decision.direction.choice;
 
-  // ----------------------------------------------------------
-  // Direction validity
-  // ----------------------------------------------------------
-
-  if (
-    !VALID_DECISIONS.has(
-      decision.direction.choice
-    )
-  ) {
-
-    warnings.push(
+  if (!VALID_DECISIONS.has(selected)) {
+    hardWarnings.push(
       "Jev returned an invalid trading decision."
     );
   }
 
-
-  // ----------------------------------------------------------
-  // Flat position checks
-  // ----------------------------------------------------------
-
   if (
     position.side === "FLAT" &&
-    (
-      decision.direction.choice === "HOLD" ||
-      decision.direction.choice === "REDUCE" ||
-      decision.direction.choice === "EXIT"
-    )
+    POSITION_MANAGEMENT_DECISIONS.has(selected)
   ) {
-
     warnings.push(
-      `${decision.direction.choice} was selected while the supplied position is FLAT.`
+      `${selected} was selected while the supplied position is FLAT.`
     );
   }
-
-
-  // ----------------------------------------------------------
-  // Accumulation
-  // ----------------------------------------------------------
 
   if (
     position.side === "FLAT" &&
     decision.probabilities.accumulation !== null &&
     decision.probabilities.accumulation >= 0.5
   ) {
-
     warnings.push(
       "Accumulation probability is elevated while the supplied position is FLAT."
     );
   }
 
-
-  // ----------------------------------------------------------
-  // Evidence
-  // ----------------------------------------------------------
-
   if (
     decision.probabilities.sufficientEvidence !== null &&
     decision.probabilities.sufficientEvidence < 0.5 &&
-    (
-      decision.direction.choice === "LONG" ||
-      decision.direction.choice === "SHORT"
-    )
+    DIRECTIONAL_DECISIONS.has(selected)
   ) {
-
-    warnings.push(
+    hardWarnings.push(
       "Directional exposure was selected despite insufficient evidence."
     );
   }
-
-
-  // ----------------------------------------------------------
-  // Risk
-  // ----------------------------------------------------------
 
   if (
     decision.probabilities.riskCompatible !== null &&
     decision.probabilities.riskCompatible < 0.5 &&
     (
-      decision.direction.choice === "LONG" ||
-      decision.direction.choice === "SHORT" ||
-      decision.direction.choice === "HOLD"
+      DIRECTIONAL_DECISIONS.has(selected) ||
+      selected === "HOLD"
     )
   ) {
-
-    warnings.push(
+    hardWarnings.push(
       "Risk compatibility is weak for the selected direction."
     );
   }
-
-
-  // ----------------------------------------------------------
-  // Thesis invalidation
-  // ----------------------------------------------------------
 
   if (
     decision.probabilities.thesisInvalidated !== null &&
     decision.probabilities.thesisInvalidated >= 0.5 &&
     position.side !== "FLAT" &&
-    decision.direction.choice !== "EXIT" &&
-    decision.direction.choice !== "REDUCE"
+    selected !== "EXIT" &&
+    selected !== "REDUCE"
   ) {
-
-    warnings.push(
+    hardWarnings.push(
       "Thesis invalidation probability is elevated without EXIT or REDUCE."
     );
   }
 
+  const bullish =
+    decision.probabilities.bullishStructure;
 
-  // ----------------------------------------------------------
-  // Bull/bear conflict
-  // ----------------------------------------------------------
+  const bearish =
+    decision.probabilities.bearishStructure;
 
   if (
-    decision.probabilities.bullishStructure !== null &&
-    decision.probabilities.bearishStructure !== null
+    bullish !== null &&
+    bearish !== null &&
+    bullish >= 0.5 &&
+    bearish >= 0.5
   ) {
-
-    const bullish =
-      decision.probabilities.bullishStructure;
-
-    const bearish =
-      decision.probabilities.bearishStructure;
-
-
-    if (
-      bullish >= 0.5 &&
-      bearish >= 0.5
-    ) {
-
-      warnings.push(
-        "Both bullish and bearish structure probabilities are elevated."
-      );
-    }
+    warnings.push(
+      "Both bullish and bearish structure probabilities are elevated."
+    );
   }
 
-
-  // ----------------------------------------------------------
-  // Directional structure mismatch
-  // ----------------------------------------------------------
-
   if (
-    decision.direction.choice === "LONG" &&
-    decision.probabilities.bearishStructure !== null &&
-    decision.probabilities.bearishStructure >= 0.75
+    selected === "LONG" &&
+    bearish !== null &&
+    bearish >= 0.75
   ) {
-
-    warnings.push(
+    hardWarnings.push(
       "LONG conflicts with strongly elevated bearish-structure probability."
     );
   }
 
-
   if (
-    decision.direction.choice === "SHORT" &&
-    decision.probabilities.bullishStructure !== null &&
-    decision.probabilities.bullishStructure >= 0.75
+    selected === "SHORT" &&
+    bullish !== null &&
+    bullish >= 0.75
   ) {
-
-    warnings.push(
+    hardWarnings.push(
       "SHORT conflicts with strongly elevated bullish-structure probability."
     );
   }
 
+  if (
+    decision.scores.reversalRisk !== null &&
+    decision.scores.reversalRisk >= 4 &&
+    DIRECTIONAL_DECISIONS.has(selected)
+  ) {
+    warnings.push(
+      "Directional decision carries high reversal-risk score."
+    );
+  }
 
   return {
-
     consistent:
-      warnings.length === 0,
+      warnings.length === 0 &&
+      hardWarnings.length === 0,
 
-    warnings
+    warnings,
+
+    hardWarnings,
+
+    severity:
+      hardWarnings.length > 0
+        ? "HIGH"
+        : warnings.length > 0
+          ? "MEDIUM"
+          : "NONE"
   };
+}
+
+
+// ============================================================
+// RESPONSE EXTRACTION
+// ============================================================
+
+function extractAnswers(result) {
+  if (!isObject(result)) {
+    return null;
+  }
+
+  if (isObject(result.answers)) {
+    return result.answers;
+  }
+
+  if (
+    isObject(result.data) &&
+    isObject(result.data.answers)
+  ) {
+    return result.data.answers;
+  }
+
+  if (
+    isObject(result.result) &&
+    isObject(result.result.answers)
+  ) {
+    return result.result.answers;
+  }
+
+  if (
+    isObject(result.output) &&
+    isObject(result.output.answers)
+  ) {
+    return result.output.answers;
+  }
+
+  return null;
+}
+
+
+function extractProviderRequestId(result) {
+  if (!isObject(result)) {
+    return null;
+  }
+
+  return (
+    normalizeString(result.id) ||
+    normalizeString(result.request_id) ||
+    normalizeString(result.requestId) ||
+    normalizeString(result.data?.id)
+  );
+}
+
+
+function extractResolvedModel(result) {
+  if (!isObject(result)) {
+    return JEV_MODEL;
+  }
+
+  return (
+    normalizeString(result.model) ||
+    normalizeString(result.data?.model) ||
+    JEV_MODEL
+  );
+}
+
+
+function extractUsage(result) {
+  if (!isObject(result)) {
+    return null;
+  }
+
+  const usage =
+    result.usage ||
+    result.data?.usage ||
+    null;
+
+  if (!isObject(usage)) {
+    return null;
+  }
+
+  return usage;
 }
 
 
@@ -931,24 +962,22 @@ async function requestJev(
   state,
   questions
 ) {
-
   const apiKey =
     typeof process.env.OPENROUTER_API_KEY === "string"
       ? process.env.OPENROUTER_API_KEY.trim()
       : "";
 
-
   if (!apiKey) {
-
     throw new Error(
       "OPENROUTER_API_KEY is not configured"
     );
   }
 
+  const requestId =
+    createRequestId();
 
   const controller =
     new AbortController();
-
 
   const timeout =
     setTimeout(
@@ -956,18 +985,25 @@ async function requestJev(
       REQUEST_TIMEOUT_MS
     );
 
+  const payload = {
+    model:
+      JEV_MODEL,
+
+    state,
+
+    questions
+  };
+
+  let response;
 
   try {
-
-    const response =
+    response =
       await fetch(
         OPENROUTER_URL,
         {
-
           method: "POST",
 
           headers: {
-
             "Authorization":
               `Bearer ${apiKey}`,
 
@@ -975,154 +1011,119 @@ async function requestJev(
               "application/json",
 
             "HTTP-Referer":
+              process.env.OPENROUTER_HTTP_REFERER ||
               "https://jev-connector.onrender.com",
 
             "X-Title":
-              "Jev Connector"
+              process.env.OPENROUTER_X_TITLE ||
+              "Jev Connector",
+
+            "X-Jev-Request-Id":
+              requestId
           },
 
           body:
-            JSON.stringify({
-
-              model:
-                JEV_MODEL,
-
-              state,
-
-              questions
-            }),
+            serializeJson(
+              payload,
+              "Jev request"
+            ),
 
           signal:
             controller.signal
         }
       );
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error(
+        `OpenRouter Jev request timed out after ${REQUEST_TIMEOUT_MS} ms`
+      );
+    }
 
+    throw new Error(
+      `OpenRouter Jev network request failed: ${
+        normalizeString(error?.message, "unknown network error")
+      }`
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
 
-    const responseText =
-      await response.text();
+  const responseText =
+    await response.text();
 
+  if (
+    byteLength(responseText) > MAX_RESPONSE_BYTES
+  ) {
+    throw new Error(
+      "OpenRouter Jev response is too large"
+    );
+  }
 
-    let result;
+  let result = {};
 
-
+  if (responseText.trim()) {
     try {
-
       result =
-        responseText
-          ? JSON.parse(responseText)
-          : {};
-
+        JSON.parse(
+          responseText
+        );
     } catch {
-
       throw new Error(
         `OpenRouter returned invalid JSON (HTTP ${response.status})`
       );
     }
+  }
 
+  if (!response.ok) {
+    const providerMessage =
+      normalizeString(result?.error?.message) ||
+      normalizeString(result?.error) ||
+      normalizeString(result?.message) ||
+      `HTTP ${response.status}`;
 
-    if (
-      !response.ok
-    ) {
-
-      const providerMessage =
-        result?.error?.message ||
-        result?.error ||
-        result?.message ||
-        `HTTP ${response.status}`;
-
-
-      throw new Error(
-        `OpenRouter Jev request failed: ${providerMessage}`
-      );
-    }
-
-
-    if (
-      !isObject(result)
-    ) {
-
-      throw new Error(
-        "OpenRouter Jev returned an invalid response"
-      );
-    }
-
-
-    if (
-      !isObject(result.answers)
-    ) {
-
-      throw new Error(
-        "OpenRouter Jev returned no structured answers"
-      );
-    }
-
-
-    return result;
-
-
-  } catch (error) {
-
-    if (
-      error?.name === "AbortError"
-    ) {
-
-      throw new Error(
-        "OpenRouter Jev request timed out after 20 seconds"
-      );
-    }
-
-
-    throw error;
-
-
-  } finally {
-
-    clearTimeout(
-      timeout
+    throw new Error(
+      `OpenRouter Jev request failed: ${providerMessage}`
     );
   }
+
+  if (!isObject(result)) {
+    throw new Error(
+      "OpenRouter Jev returned an invalid response"
+    );
+  }
+
+  const answers =
+    extractAnswers(result);
+
+  if (!answers) {
+    throw new Error(
+      "OpenRouter Jev returned no structured answers"
+    );
+  }
+
+  return {
+    result,
+    requestId
+  };
 }
 
 
 // ============================================================
-// MAIN EVALUATION FUNCTION
+// EVALUATION STATE
 // ============================================================
 
-export async function evaluateMarketState(
-  state
+function buildEvaluationState(
+  state,
+  position
 ) {
-
-  validateState(
-    state
-  );
-
-
-  const position =
-    normalizePosition(
-      state
-    );
-
-
-  const questions =
-    buildQuestions();
-
-
-  // ----------------------------------------------------------
-  // Evaluation state
-  // ----------------------------------------------------------
-
-  const evaluationState = {
-
+  return {
     market:
       state,
-
 
     currentPosition:
       position,
 
-
     environment: {
-
       marketType:
         "real_market",
 
@@ -1139,9 +1140,7 @@ export async function evaluateMarketState(
         true
     },
 
-
     systemBoundary: {
-
       executionEnabled:
         false,
 
@@ -1161,60 +1160,64 @@ export async function evaluateMarketState(
         false
     },
 
-
     evaluationRules: [
-
       "Evaluate only the supplied evidence.",
-
       "Do not invent missing market information.",
-
       "Missing information is uncertainty, not positive evidence.",
-
       "Do not force a trade.",
-
       "WAIT is a valid decision.",
-
       "Accumulation must not become uncontrolled averaging.",
-
       "Long and short setups are both permitted.",
-
       "Prediction-market logic is forbidden.",
-
       "A setup score is not a profit probability.",
-
       "Jev does not authorize execution.",
-
       "Risk controls have authority over Jev.",
-
       "If evidence is contradictory, prefer WAIT or risk reduction."
     ]
   };
+}
 
 
-  // ----------------------------------------------------------
-  // Call Jev
-  // ----------------------------------------------------------
+// ============================================================
+// MAIN EVALUATION FUNCTION
+// ============================================================
 
-  const result =
+export async function evaluateMarketState(
+  state
+) {
+  validateState(state);
+
+  const position =
+    normalizePosition(state);
+
+  const questions =
+    buildQuestions();
+
+  const evaluationState =
+    buildEvaluationState(
+      state,
+      position
+    );
+
+  const requestedAt =
+    new Date().toISOString();
+
+  const request =
     await requestJev(
       evaluationState,
       questions
     );
 
+  const result =
+    request.result;
 
-  // ----------------------------------------------------------
-  // Normalize
-  // ----------------------------------------------------------
+  const answers =
+    extractAnswers(result);
 
   const decision =
     normalizeAnswers(
-      result.answers
+      answers
     );
-
-
-  // ----------------------------------------------------------
-  // Consistency
-  // ----------------------------------------------------------
 
   const consistency =
     analyzeConsistency(
@@ -1222,38 +1225,27 @@ export async function evaluateMarketState(
       position
     );
 
-
-  // ----------------------------------------------------------
-  // Direction confidence
-  //
-  // Jev's Choice answer provides confidence.
-  // We do NOT invent an "overall confidence" by averaging
-  // unrelated probabilities.
-  // ----------------------------------------------------------
-
   const directionConfidence =
     decision.confidence.direction;
 
-
-  // ----------------------------------------------------------
-  // Provider/model information
-  // ----------------------------------------------------------
-
   const resolvedModel =
-    typeof result.model === "string" &&
-    result.model.length > 0
-      ? result.model
-      : JEV_MODEL;
+    extractResolvedModel(
+      result
+    );
 
+  const providerRequestId =
+    extractProviderRequestId(
+      result
+    ) ||
+    request.requestId;
 
-  // ----------------------------------------------------------
-  // Return
-  // ----------------------------------------------------------
+  const responseTimestamp =
+    safeIsoTimestamp(
+      result.timestamp
+    );
 
   return {
-
     engine: {
-
       name:
         ENGINE_NAME,
 
@@ -1269,46 +1261,58 @@ export async function evaluateMarketState(
       resolvedModel
     },
 
+    request: {
+      requestId:
+        request.requestId,
+
+      requestedAt,
+
+      endpoint:
+        OPENROUTER_URL,
+
+      timeoutMs:
+        REQUEST_TIMEOUT_MS
+    },
 
     position,
 
-
     decision,
 
-
     confidence: {
-
       direction:
         directionConfidence
     },
 
-
     usage:
-      result.usage ??
-      null,
+      extractUsage(result),
 
-
-    providerRequestId:
-      result.id ??
-      null,
-
+    providerRequestId,
 
     consistency,
 
+    safety: {
+      executionApproved:
+        false,
+
+      requiresTraderRiskReview:
+        true,
+
+      blockExecutionWhenInconsistent:
+        true,
+
+      blockReasons:
+        consistency.hardWarnings
+    },
 
     execution: {
-
       allowed:
         false,
 
       reason:
-        "Jev is evaluation-only. " +
-        "A separate Trader Risk Engine must approve any future action."
+        "Jev is evaluation-only. A separate Trader Risk Engine must approve any future action."
     },
 
-
     security: {
-
       walletAccess:
         false,
 
@@ -1325,17 +1329,66 @@ export async function evaluateMarketState(
         false
     },
 
-
     timestamp:
+      responseTimestamp ||
       new Date().toISOString()
   };
 }
 
 
 // ============================================================
-// OPTIONAL DEFAULT EXPORT
+// ENGINE INFORMATION
+// ============================================================
+
+export function getJevEngineStatus() {
+  return {
+    name:
+      ENGINE_NAME,
+
+    version:
+      ENGINE_VERSION,
+
+    provider:
+      "openrouter",
+
+    model:
+      JEV_MODEL,
+
+    endpointConfigured:
+      Boolean(OPENROUTER_URL),
+
+    apiKeyConfigured:
+      Boolean(
+        typeof process.env.OPENROUTER_API_KEY === "string" &&
+        process.env.OPENROUTER_API_KEY.trim()
+      ),
+
+    executionEnabled:
+      false,
+
+    walletAccess:
+      false,
+
+    privateKeys:
+      false,
+
+    withdrawals:
+      false
+  };
+}
+
+
+export function getJevQuestions() {
+  return buildQuestions();
+}
+
+
+// ============================================================
+// DEFAULT EXPORT
 // ============================================================
 
 export default {
-  evaluateMarketState
+  evaluateMarketState,
+  getJevEngineStatus,
+  getJevQuestions
 };
