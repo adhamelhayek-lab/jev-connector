@@ -33,7 +33,6 @@ import {
 } from "./jev-engine.js";
 
 import {
-  runTrader,
   getEngineStatus
 } from "./trader-engine.js";
 
