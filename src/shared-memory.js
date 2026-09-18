@@ -1,624 +1,474 @@
 // shared-memory.js
-// Jev Shared Memory Layer
-// V2.0.0
+// Jev Shared Memory V3.0.0
 //
 // Purpose:
-// - Shared memory for Jev
-// - Safe local fallback
-// - Optional remote Shared Memory Hub
-// - Search memories
-// - Recent memories
-// - Jev memory context
-// - Connection/status diagnostics
-// - Never expose secrets
+// - Persistent Jev memory using Upstash Redis REST
+// - Safe local fallback if Redis is unavailable
+// - Search and recent-memory retrieval
+// - Memory statistics and connection status
+// - Compatible with Jev Connector API
 //
-// IMPORTANT:
-// This module does NOT contain exchange credentials.
-// It does NOT execute trades.
+// Environment variables:
+// - UPSTASH_REDIS_REST_URL
+// - UPSTASH_REDIS_REST_TOKEN
+// - SHARED_MEMORY_NAMESPACE (optional)
 
-const MEMORY_SERVICE_URL =
-  typeof process.env.SHARED_MEMORY_URL === "string"
-    ? process.env.SHARED_MEMORY_URL.trim().replace(/\/+$/, "")
-    : "";
+const REDIS_URL =
+  process.env.UPSTASH_REDIS_REST_URL?.trim().replace(/\/+$/, "") || "";
 
-const MEMORY_API_KEY =
-  typeof process.env.SHARED_MEMORY_API_KEY === "string"
-    ? process.env.SHARED_MEMORY_API_KEY.trim()
-    : "";
+const REDIS_TOKEN =
+  process.env.UPSTASH_REDIS_REST_TOKEN?.trim() || "";
 
-const MAX_MEMORIES = 1000;
+const NAMESPACE =
+  process.env.SHARED_MEMORY_NAMESPACE?.trim() || "jev:memory";
 
-const memoryStore = [];
+const MEMORY_KEY = `${NAMESPACE}:items`;
 
-const runtime = {
-  configured: Boolean(MEMORY_SERVICE_URL),
-  connected: false,
-  lastConnectionCheck: null,
-  lastError: null,
-  lastWriteAt: null,
-  totalReads: 0,
-  totalWrites: 0,
-  remoteReads: 0,
-  remoteWrites: 0
-};
+const MAX_MEMORY_ITEMS = 1000;
 
-/* =========================================================
-   HELPERS
-   ========================================================= */
+const localMemory = [];
 
-function safeString(value, fallback = "") {
-  return typeof value === "string"
-    ? value.trim()
-    : fallback;
+let lastConnectionCheck = null;
+let lastError = null;
+let lastKnownCount = 0;
+
+function isConfigured() {
+  return Boolean(REDIS_URL && REDIS_TOKEN);
 }
 
-function nowIso() {
+function makeId() {
+  return `mem_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function now() {
   return new Date().toISOString();
 }
 
-function createMemoryId() {
-  return `jev-mem-${Date.now()}-${Math.random()
-    .toString(36)
-    .slice(2, 10)}`;
-}
-
 function normalizeMemory(input = {}) {
-  const source =
-    input &&
-    typeof input === "object" &&
-    !Array.isArray(input)
-      ? input
-      : {};
+  if (typeof input === "string") {
+    return {
+      id: makeId(),
+      createdAt: now(),
+      content: input,
+      type: "text",
+      tags: [],
+    };
+  }
 
   return {
-    id:
-      safeString(source.id) ||
-      createMemoryId(),
-
-    timestamp:
-      safeString(source.timestamp) ||
-      nowIso(),
-
-    source:
-      safeString(source.source, "jev"),
-
-    type:
-      safeString(source.type, "observation"),
-
-    symbol:
-      safeString(source.symbol).toUpperCase() ||
-      null,
-
-    importance:
-      Number.isFinite(Number(source.importance))
-        ? Math.max(
-            0,
-            Math.min(
-              1,
-              Number(source.importance)
-            )
-          )
-        : 0.5,
-
+    id: input.id || makeId(),
+    createdAt: input.createdAt || now(),
+    type: input.type || "memory",
     content:
-      safeString(source.content),
-
+      input.content ??
+      input.text ??
+      input.message ??
+      input.value ??
+      "",
+    tags: Array.isArray(input.tags) ? input.tags : [],
+    source: input.source || "jev",
     metadata:
-      source.metadata &&
-      typeof source.metadata === "object" &&
-      !Array.isArray(source.metadata)
-        ? source.metadata
-        : {}
+      input.metadata && typeof input.metadata === "object"
+        ? input.metadata
+        : {},
   };
 }
 
-function trimStore() {
-  while (
-    memoryStore.length >
-    MAX_MEMORIES
-  ) {
-    memoryStore.shift();
+async function redisCommand(command) {
+  if (!isConfigured()) {
+    throw new Error("Upstash Redis is not configured");
   }
+
+  const response = await fetch(REDIS_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${REDIS_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(command),
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(
+      `Upstash Redis HTTP ${response.status}${body ? `: ${body}` : ""}`
+    );
+  }
+
+  const result = await response.json();
+
+  if (result?.error) {
+    throw new Error(String(result.error));
+  }
+
+  return result?.result;
 }
 
-function headers() {
-  const result = {
-    "Content-Type": "application/json"
-  };
-
-  if (MEMORY_API_KEY) {
-    result.Authorization =
-      `Bearer ${MEMORY_API_KEY}`;
-  }
-
-  return result;
+async function pingRedis() {
+  return await redisCommand(["PING"]);
 }
 
-/* =========================================================
-   LOCAL MEMORY
-   ========================================================= */
+/**
+ * Save one memory.
+ */
+export async function saveSharedMemory(input) {
+  const memory = normalizeMemory(input);
+  const encoded = JSON.stringify(memory);
 
-function saveLocalMemory(memory) {
-  const normalized =
-    normalizeMemory(memory);
+  if (isConfigured()) {
+    try {
+      await redisCommand(["LPUSH", MEMORY_KEY, encoded]);
+      await redisCommand([
+        "LTRIM",
+        MEMORY_KEY,
+        0,
+        MAX_MEMORY_ITEMS - 1,
+      ]);
 
-  if (!normalized.content) {
-    return null;
-  }
+      lastError = null;
+      lastConnectionCheck = now();
 
-  memoryStore.push(normalized);
-  trimStore();
-
-  runtime.totalWrites += 1;
-  runtime.lastWriteAt = nowIso();
-
-  return normalized;
-}
-
-function searchLocalMemories(
-  query,
-  options = {}
-) {
-  const text =
-    safeString(query).toLowerCase();
-
-  const limit =
-    Number.isFinite(Number(options.limit))
-      ? Math.max(
-          1,
-          Math.min(
-            100,
-            Number(options.limit)
-          )
-        )
-      : 20;
-
-  if (!text) {
-    return memoryStore
-      .slice(-limit)
-      .reverse();
-  }
-
-  const terms =
-    text
-      .split(/\s+/)
-      .filter(Boolean);
-
-  return memoryStore
-    .map((memory) => {
-      const haystack =
-        `${memory.content} ${
-          memory.symbol || ""
-        } ${
-          memory.type || ""
-        }`.toLowerCase();
-
-      let score = 0;
-
-      for (const term of terms) {
-        if (haystack.includes(term)) {
-          score += 1;
-        }
-      }
-
-      score +=
-        memory.importance * 0.5;
+      const count = await redisCommand(["LLEN", MEMORY_KEY]);
+      lastKnownCount = Number(count) || 0;
 
       return {
+        ok: true,
+        persistent: true,
         memory,
-        score
       };
-    })
-    .filter((item) => item.score > 0)
-    .sort(
-      (a, b) =>
-        b.score - a.score
-    )
-    .slice(0, limit)
-    .map((item) => item.memory);
-}
-
-/* =========================================================
-   REMOTE MEMORY
-   ========================================================= */
-
-async function remoteRequest(
-  path,
-  options = {}
-) {
-  if (!MEMORY_SERVICE_URL) {
-    return null;
-  }
-
-  const controller =
-    new AbortController();
-
-  const timeout =
-    setTimeout(
-      () => controller.abort(),
-      5000
-    );
-
-  try {
-    const response =
-      await fetch(
-        `${MEMORY_SERVICE_URL}${path}`,
-        {
-          ...options,
-          headers: {
-            ...headers(),
-            ...(options.headers || {})
-          },
-          signal:
-            controller.signal
-        }
-      );
-
-    if (!response.ok) {
-      throw new Error(
-        `Shared Memory HTTP ${response.status}`
-      );
+    } catch (error) {
+      lastError = error?.message || String(error);
     }
-
-    runtime.connected = true;
-    runtime.lastConnectionCheck =
-      nowIso();
-    runtime.lastError = null;
-
-    return await response.json();
-  } catch (error) {
-    runtime.connected = false;
-    runtime.lastConnectionCheck =
-      nowIso();
-
-    runtime.lastError =
-      error instanceof Error
-        ? error.message
-        : "Unknown shared-memory error";
-
-    return null;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-/* =========================================================
-   CONNECTION
-   ========================================================= */
-
-export async function checkSharedMemoryConnection() {
-  if (!MEMORY_SERVICE_URL) {
-    runtime.configured = false;
-    runtime.connected = false;
-    runtime.lastConnectionCheck =
-      nowIso();
-
-    return {
-      configured: false,
-      connected: false,
-      mode: "local-fallback",
-      reason:
-        "SHARED_MEMORY_URL is not configured."
-    };
   }
 
-  const result =
-    await remoteRequest("/health");
+  // Safe local fallback.
+  localMemory.unshift(memory);
 
-  if (!result) {
-    return {
-      configured: true,
-      connected: false,
-      mode: "remote",
-      reason:
-        runtime.lastError ||
-        "Shared Memory service is unavailable."
-    };
+  if (localMemory.length > MAX_MEMORY_ITEMS) {
+    localMemory.length = MAX_MEMORY_ITEMS;
   }
+
+  lastKnownCount = localMemory.length;
 
   return {
-    configured: true,
-    connected: true,
-    mode: "remote",
-    reason: null
+    ok: true,
+    persistent: false,
+    fallback: true,
+    memory,
   };
 }
 
-/* =========================================================
-   WRITE
-   ========================================================= */
-
-export async function getSharedMemory(
-  options = {}
-) {
-  runtime.totalReads += 1;
-
-  const limit =
-    Number.isFinite(Number(options.limit))
-      ? Math.max(
-          1,
-          Math.min(
-            100,
-            Number(options.limit)
-          )
-        )
-      : 50;
-
-  if (MEMORY_SERVICE_URL) {
-    const result =
-      await remoteRequest(
-        `/memories?limit=${limit}`
-      );
-
-    if (
-      result &&
-      Array.isArray(result.memories)
-    ) {
-      runtime.remoteReads += 1;
-
-      return result.memories.map(
-        normalizeMemory
-      );
-    }
-  }
-
-  return memoryStore
-    .slice(-limit)
-    .reverse();
-}
-
-export async function saveSharedMemory(
-  memory
-) {
-  const normalized =
-    normalizeMemory(memory);
-
-  if (!normalized.content) {
-    throw new Error(
-      "Memory content is required."
-    );
-  }
-
-  if (MEMORY_SERVICE_URL) {
-    const result =
-      await remoteRequest(
-        "/memories",
-        {
-          method: "POST",
-          body: JSON.stringify(
-            normalized
-          )
-        }
-      );
-
-    if (result) {
-      runtime.remoteWrites += 1;
-      runtime.totalWrites += 1;
-      runtime.lastWriteAt =
-        nowIso();
-
-      return (
-        result.memory ||
-        normalized
-      );
-    }
-  }
-
-  return saveLocalMemory(
-    normalized
+/**
+ * Get recent memories.
+ */
+export async function getRecentMemories(limit = 20) {
+  const safeLimit = Math.min(
+    Math.max(Number(limit) || 20, 1),
+    100
   );
+
+  if (isConfigured()) {
+    try {
+      const result = await redisCommand([
+        "LRANGE",
+        MEMORY_KEY,
+        0,
+        safeLimit - 1,
+      ]);
+
+      const memories = Array.isArray(result)
+        ? result
+            .map((item) => {
+              try {
+                return JSON.parse(item);
+              } catch {
+                return null;
+              }
+            })
+            .filter(Boolean)
+        : [];
+
+      lastError = null;
+      lastConnectionCheck = now();
+
+      return memories;
+    } catch (error) {
+      lastError = error?.message || String(error);
+    }
+  }
+
+  return localMemory.slice(0, safeLimit);
 }
 
-/* =========================================================
-   SEARCH
-   ========================================================= */
+/**
+ * Get all available memory records for internal operations.
+ */
+async function getAllMemories() {
+  if (isConfigured()) {
+    try {
+      const result = await redisCommand([
+        "LRANGE",
+        MEMORY_KEY,
+        0,
+        MAX_MEMORY_ITEMS - 1,
+      ]);
 
-export async function searchSharedMemory(
-  query,
-  options = {}
-) {
-  runtime.totalReads += 1;
+      const memories = Array.isArray(result)
+        ? result
+            .map((item) => {
+              try {
+                return JSON.parse(item);
+              } catch {
+                return null;
+              }
+            })
+            .filter(Boolean)
+        : [];
 
-  const text =
-    safeString(query);
+      lastError = null;
+      lastConnectionCheck = now();
+
+      return memories;
+    } catch (error) {
+      lastError = error?.message || String(error);
+    }
+  }
+
+  return [...localMemory];
+}
+
+/**
+ * Search memories.
+ */
+export async function searchSharedMemory(query, options = {}) {
+  const text = String(query || "").trim().toLowerCase();
 
   if (!text) {
     return [];
   }
 
-  const limit =
-    Number.isFinite(Number(options.limit))
-      ? Math.max(
-          1,
-          Math.min(
-            100,
-            Number(options.limit)
-          )
-        )
-      : 20;
+  const limit = Math.min(
+    Math.max(Number(options.limit) || 20, 1),
+    100
+  );
 
-  if (MEMORY_SERVICE_URL) {
-    const encoded =
-      encodeURIComponent(text);
+  const memories = await getAllMemories();
 
-    const result =
-      await remoteRequest(
-        `/memories/search?q=${encoded}&limit=${limit}`
+  const terms = text
+    .split(/\s+/)
+    .map((term) => term.trim())
+    .filter(Boolean);
+
+  const results = memories
+    .map((memory) => {
+      const searchable = [
+        memory.content,
+        memory.type,
+        memory.source,
+        ...(Array.isArray(memory.tags) ? memory.tags : []),
+        JSON.stringify(memory.metadata || {}),
+      ]
+        .join(" ")
+        .toLowerCase();
+
+      let score = 0;
+
+      for (const term of terms) {
+        if (searchable.includes(term)) {
+          score += 1;
+        }
+      }
+
+      return {
+        memory,
+        score,
+      };
+    })
+    .filter((item) => item.score > 0)
+    .sort((a, b) => {
+      if (b.score !== a.score) {
+        return b.score - a.score;
+      }
+
+      return String(b.memory.createdAt).localeCompare(
+        String(a.memory.createdAt)
       );
+    })
+    .slice(0, limit);
 
-    if (
-      result &&
-      Array.isArray(result.memories)
-    ) {
-      runtime.remoteReads += 1;
+  return results.map((item) => ({
+    ...item.memory,
+    score: item.score,
+  }));
+}
 
-      return result.memories.map(
-        normalizeMemory
-      );
+/**
+ * Compatibility helper.
+ */
+export async function getSharedMemory(options = {}) {
+  return await getRecentMemories(options.limit || 20);
+}
+
+/**
+ * Build memory context for Jev.
+ */
+export async function buildJevMemoryContext(query, options = {}) {
+  const memories = await searchSharedMemory(query, {
+    limit: options.limit || 10,
+  });
+
+  if (!memories.length) {
+    return "";
+  }
+
+  return memories
+    .map((memory, index) => {
+      const content =
+        typeof memory.content === "string"
+          ? memory.content
+          : JSON.stringify(memory.content);
+
+      return `[Memory ${index + 1}] ${content}`;
+    })
+    .join("\n");
+}
+
+/**
+ * Return a complete Jev memory snapshot.
+ */
+export async function getJevMemorySnapshot() {
+  const recent = await getRecentMemories(20);
+  const stats = await getSharedMemoryStats();
+
+  return {
+    ok: true,
+    stats,
+    recent,
+  };
+}
+
+/**
+ * Get memory statistics.
+ */
+export async function getSharedMemoryStats() {
+  if (isConfigured()) {
+    try {
+      const count = await redisCommand(["LLEN", MEMORY_KEY]);
+
+      lastKnownCount = Number(count) || 0;
+      lastError = null;
+
+      return {
+        ok: true,
+        configured: true,
+        persistent: true,
+        mode: "upstash-redis",
+        memoryCount: lastKnownCount,
+        namespace: NAMESPACE,
+        maxMemoryItems: MAX_MEMORY_ITEMS,
+      };
+    } catch (error) {
+      lastError = error?.message || String(error);
     }
   }
 
-  return searchLocalMemories(
-    text,
-    { limit }
-  );
-}
-
-/* =========================================================
-   RECENT MEMORIES
-   ========================================================= */
-
-export async function getRecentMemories(
-  limit = 20
-) {
-  const safeLimit =
-    Math.max(
-      1,
-      Math.min(
-        100,
-        Number(limit) || 20
-      )
-    );
-
-  return getSharedMemory({
-    limit: safeLimit
-  });
-}
-
-/* =========================================================
-   JEV MEMORY CONTEXT
-   ========================================================= */
-
-export async function buildJevMemoryContext(
-  state = {},
-  options = {}
-) {
-  const symbol =
-    safeString(
-      state?.symbol ??
-      state?.market?.symbol
-    ).toUpperCase();
-
-  const query =
-    symbol
-      ? `Jev ${symbol} trading market risk accumulation`
-      : "Jev trading market risk accumulation";
-
-  const memories =
-    await searchSharedMemory(
-      query,
-      {
-        limit:
-          options.limit ?? 10
-      }
-    );
-
   return {
-    symbol: symbol || null,
-
-    memories,
-
-    count:
-      memories.length,
-
-    generatedAt:
-      nowIso()
+    ok: true,
+    configured: false,
+    persistent: false,
+    mode: "local-fallback",
+    memoryCount: localMemory.length,
+    namespace: NAMESPACE,
+    maxMemoryItems: MAX_MEMORY_ITEMS,
   };
 }
 
-/* =========================================================
-   SNAPSHOT
-   ========================================================= */
+/**
+ * Check Redis connection.
+ */
+export async function checkSharedMemoryConnection() {
+  const checkedAt = now();
 
-export async function getJevMemorySnapshot() {
-  const recent =
-    await getRecentMemories(20);
+  if (!isConfigured()) {
+    lastConnectionCheck = checkedAt;
+    lastError = null;
+    lastKnownCount = localMemory.length;
 
-  return {
-    engine: "Jev",
-    generatedAt: nowIso(),
+    return {
+      ok: true,
+      configured: false,
+      connected: false,
+      mode: "local-fallback",
+      readOnly: false,
+      checkedAt,
+      error: null,
+      memoryCount: localMemory.length,
+    };
+  }
 
-    memories: recent,
+  try {
+    const result = await pingRedis();
 
-    stats:
-      getSharedMemoryStats(),
+    const count = await redisCommand(["LLEN", MEMORY_KEY]);
 
-    status:
-      getSharedMemoryStatus()
-  };
+    lastConnectionCheck = checkedAt;
+    lastError = null;
+    lastKnownCount = Number(count) || 0;
+
+    return {
+      ok: true,
+      configured: true,
+      connected: true,
+      mode: "upstash-redis",
+      readOnly: false,
+      checkedAt,
+      ping: result,
+      error: null,
+      memoryCount: lastKnownCount,
+    };
+  } catch (error) {
+    lastConnectionCheck = checkedAt;
+    lastError = error?.message || String(error);
+
+    return {
+      ok: false,
+      configured: true,
+      connected: false,
+      mode: "upstash-redis",
+      readOnly: false,
+      checkedAt,
+      error: lastError,
+      memoryCount: lastKnownCount,
+    };
+  }
 }
 
-/* =========================================================
-   STATS
-   ========================================================= */
+/**
+ * Get current memory status.
+ */
+export async function getSharedMemoryStatus() {
+  const connection = await checkSharedMemoryConnection();
 
-export function getSharedMemoryStats() {
   return {
-    localMemoryCount:
-      memoryStore.length,
-
-    totalReads:
-      runtime.totalReads,
-
-    totalWrites:
-      runtime.totalWrites,
-
-    remoteReads:
-      runtime.remoteReads,
-
-    remoteWrites:
-      runtime.remoteWrites,
-
-    lastWriteAt:
-      runtime.lastWriteAt
-  };
-}
-
-/* =========================================================
-   STATUS
-   ========================================================= */
-
-export function getSharedMemoryStatus() {
-  return {
-    configured:
-      Boolean(
-        MEMORY_SERVICE_URL
-      ),
-
-    connected:
-      runtime.connected,
-
-    mode:
-      MEMORY_SERVICE_URL
-        ? "remote-with-local-fallback"
-        : "local-fallback",
-
-    readOnly:
-      false,
-
+    configured: connection.configured,
+    connected: connection.connected,
+    mode: connection.mode,
+    readOnly: connection.readOnly,
     lastConnectionCheck:
-      runtime.lastConnectionCheck,
-
-    lastError:
-      runtime.lastError,
-
-    memoryCount:
-      memoryStore.length
+      lastConnectionCheck || connection.checkedAt || null,
+    lastError: lastError || connection.error || null,
+    memoryCount: connection.memoryCount ?? lastKnownCount,
   };
 }
-
-/* =========================================================
-   DEFAULT EXPORT
-   ========================================================= */
 
 export default {
   getSharedMemory,
   saveSharedMemory,
   searchSharedMemory,
   getRecentMemories,
-  getSharedMemoryStats,
   buildJevMemoryContext,
   getJevMemorySnapshot,
+  getSharedMemoryStats,
   checkSharedMemoryConnection,
-  getSharedMemoryStatus
+  getSharedMemoryStatus,
 };
