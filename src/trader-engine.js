@@ -203,6 +203,33 @@ function normalizePolicy(input = {}) {
       positiveNumberOrNull(merged.minDcaDistanceBps)
       ?? DEFAULT_POLICY.minDcaDistanceBps,
 
+    dcaEntryEnabled:
+  merged.dcaEntryEnabled !== false,
+
+dcaEntryMode:
+  typeof merged.dcaEntryMode === "string" &&
+  merged.dcaEntryMode.trim()
+    ? merged.dcaEntryMode.trim().toUpperCase()
+    : DEFAULT_POLICY.dcaEntryMode,
+
+dcaInitialNotional:
+  positiveNumberOrNull(merged.dcaInitialNotional)
+  ?? DEFAULT_POLICY.dcaInitialNotional,
+
+dcaCopySignalEnabled:
+  merged.dcaCopySignalEnabled !== false,
+
+dcaCopySignalMaxAgeSeconds:
+  positiveNumberOrNull(merged.dcaCopySignalMaxAgeSeconds)
+  ?? DEFAULT_POLICY.dcaCopySignalMaxAgeSeconds,
+
+dcaCopyMinConfidence:
+  positiveNumberOrNull(merged.dcaCopyMinConfidence)
+  ?? DEFAULT_POLICY.dcaCopyMinConfidence,
+
+dcaPriceCheckRequired:
+  merged.dcaPriceCheckRequired !== false,
+
     manualAccumulationExit:
       merged.manualAccumulationExit !== false,
 
