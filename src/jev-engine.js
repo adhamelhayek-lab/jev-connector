@@ -1,50 +1,64 @@
-// Jev Connector
-// Jev Trading Evaluation Engine V2.1
+// ============================================================
+// JEV CONNECTOR
+// TRADING EVALUATION ENGINE V3.1
+// ============================================================
+//
+// Provider:
+//   OpenRouter Decisions API
+//
+// Model:
+//   TypeSafe Jev 1.13
 //
 // Purpose:
-// - Evaluate real-market conditions
-// - Evaluate LONG / SHORT / HOLD / REDUCE / EXIT / WAIT
-// - Evaluate accumulation conditions
-// - Evaluate market structure
-// - Evaluate evidence quality
-// - Evaluate risk compatibility
-// - Evaluate thesis invalidation
-// - Preserve Jev probabilities
+//   - Evaluate real-market state
+//   - Evaluate LONG / SHORT / HOLD / REDUCE / EXIT / WAIT
+//   - Evaluate market structure
+//   - Evaluate evidence quality
+//   - Evaluate risk compatibility
+//   - Evaluate accumulation conditions
+//   - Detect thesis invalidation
+//   - Evaluate reversal risk
+//   - Preserve Jev probabilities and confidence
 //
 // SECURITY BOUNDARY
 // -----------------
-// Jev does NOT:
-// - place trades
-// - access wallets
-// - hold private keys
-// - withdraw funds
-// - modify exchange permissions
-// - bypass risk controls
+// This module NEVER:
+//   - places trades
+//   - accesses wallets
+//   - accesses private keys
+//   - withdraws funds
+//   - changes exchange permissions
+//   - bypasses risk controls
+//   - overrides the Trader risk engine
 //
-// Jev evaluates market state.
-// The future Risk Engine controls permission.
-// The future Execution Engine controls orders.
+// Jev evaluates.
+// Other modules decide whether execution is permitted.
 //
-// REAL MARKET ONLY.
-// No prediction-market logic.
-
-import {
-  experimental_evaluate as evaluate
-} from "ai";
+// ============================================================
 
 
 // ============================================================
 // CONFIGURATION
 // ============================================================
 
+const OPENROUTER_URL =
+  "https://openrouter.ai/api/alpha/decisions";
+
 const JEV_MODEL =
-  process.env.JEV_MODEL || "typesafe-ai/jev";
+  process.env.JEV_MODEL ||
+  "typesafe/jev-1.13";
 
 const ENGINE_NAME =
   "Jev Trading Evaluation Engine";
 
 const ENGINE_VERSION =
-  "2.1.0";
+  "3.1.0";
+
+const REQUEST_TIMEOUT_MS =
+  20_000;
+
+const MAX_STATE_BYTES =
+  900_000;
 
 
 // ============================================================
@@ -70,7 +84,47 @@ const VALID_DECISIONS =
 
 
 // ============================================================
-// VALIDATION
+// BASIC HELPERS
+// ============================================================
+
+function isObject(value) {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value)
+  );
+}
+
+
+function clamp01(value) {
+  if (
+    typeof value !== "number" ||
+    !Number.isFinite(value)
+  ) {
+    return null;
+  }
+
+  return Math.min(
+    1,
+    Math.max(0, value)
+  );
+}
+
+
+function safeNumber(value) {
+  if (
+    typeof value !== "number" ||
+    !Number.isFinite(value)
+  ) {
+    return null;
+  }
+
+  return value;
+}
+
+
+// ============================================================
+// STATE VALIDATION
 // ============================================================
 
 function validateState(state) {
@@ -83,8 +137,10 @@ function validateState(state) {
     );
   }
 
+
   const stateType =
     typeof state;
+
 
   if (
     stateType !== "object" &&
@@ -92,6 +148,31 @@ function validateState(state) {
   ) {
     throw new Error(
       "Market state must be an object, array, or string"
+    );
+  }
+
+
+  let serialized;
+
+  try {
+    serialized =
+      JSON.stringify(state);
+  } catch {
+    throw new Error(
+      "Market state cannot be serialized"
+    );
+  }
+
+
+  if (
+    typeof serialized === "string" &&
+    Buffer.byteLength(
+      serialized,
+      "utf8"
+    ) > MAX_STATE_BYTES
+  ) {
+    throw new Error(
+      "Market state is too large for Jev evaluation"
     );
   }
 }
@@ -102,6 +183,7 @@ function validateState(state) {
 // ============================================================
 
 function normalizePosition(state) {
+
   const emptyPosition = {
     side: "FLAT",
     size: null,
@@ -111,30 +193,33 @@ function normalizePosition(state) {
     leverage: null
   };
 
+
   if (
-    !state ||
-    typeof state !== "object" ||
-    Array.isArray(state)
+    !isObject(state)
   ) {
     return emptyPosition;
   }
 
+
   if (
-    !state.position ||
-    typeof state.position !== "object"
+    !isObject(state.position)
   ) {
     return emptyPosition;
   }
+
 
   const position =
     state.position;
+
 
   const rawSide =
     typeof position.side === "string"
       ? position.side.toUpperCase()
       : "FLAT";
 
+
   return {
+
     side:
       VALID_POSITION_SIDES.has(rawSide)
         ? rawSide
@@ -161,23 +246,34 @@ function normalizePosition(state) {
 // ============================================================
 // QUESTION DEFINITIONS
 // ============================================================
+//
+// OpenRouter's native Jev Decisions API uses:
+//
+//   noul    -> yes/no probability
+//   choice  -> selected option + probability distribution
+//   score   -> ordered numerical score + distribution
+//
+// ============================================================
 
 function buildQuestions() {
+
   return {
 
     // --------------------------------------------------------
-    // PRIMARY TRADING DIRECTION
+    // DIRECTION
     // --------------------------------------------------------
 
     direction: {
+
       type: "choice",
 
       instructions:
-        "Evaluate the supplied real-market state and select the most " +
-        "appropriate current trading decision. Consider market structure, " +
-        "trend, momentum, volume, liquidity, volatility, derivatives data, " +
-        "current position, invalidation conditions and supplied risk data. " +
-        "Do not force a directional trade when evidence is insufficient.",
+        "Evaluate the supplied real-market state and select the " +
+        "most appropriate current trading decision. Consider market " +
+        "structure, trend, momentum, volume, liquidity, volatility, " +
+        "derivatives data, current position, invalidation conditions " +
+        "and supplied risk information. Do not force a directional " +
+        "trade when evidence is insufficient.",
 
       criteria: {
 
@@ -190,21 +286,22 @@ function buildQuestions() {
           "that could justify short exposure.",
 
         HOLD:
-          "An existing position remains supported and should generally remain " +
-          "unchanged.",
+          "An existing position remains supported and should generally " +
+          "remain unchanged.",
 
         REDUCE:
-          "Existing exposure should be reduced because risk has increased or " +
-          "the strength of the thesis has weakened, but complete exit is not " +
-          "yet clearly required.",
+          "Existing exposure should be reduced because risk has increased " +
+          "or the strength of the thesis has weakened, but complete exit " +
+          "is not clearly required.",
 
         EXIT:
-          "An existing position should be closed because the thesis has failed, " +
-          "invalidation conditions are present, or risk has materially changed.",
+          "An existing position should be closed because the thesis has " +
+          "failed, invalidation conditions are present, or risk has " +
+          "materially changed.",
 
         WAIT:
-          "Evidence is insufficient, contradictory, stale, or unreliable for " +
-          "a meaningful directional decision."
+          "Evidence is insufficient, contradictory, stale, or unreliable " +
+          "for a meaningful directional decision."
       }
     },
 
@@ -214,24 +311,15 @@ function buildQuestions() {
     // --------------------------------------------------------
 
     accumulation: {
-      type: "boolean",
+
+      type: "noul",
 
       instructions:
-        "Determine whether controlled additional entries into an existing " +
-        "position are supported by the supplied evidence. Do not recommend " +
-        "accumulation merely because price moved against the position. Consider " +
-        "trend confirmation, liquidity, volatility, current exposure, invalidation " +
-        "and risk information.",
-
-      criteria: {
-        true:
-          "The supplied evidence supports controlled additional entries " +
-          "without relying on loss-chasing.",
-
-        false:
-          "Accumulation is unsupported, premature, too risky, or the required " +
-          "evidence is missing."
-      }
+        "Determine whether the supplied evidence supports controlled " +
+        "additional exposure to an existing position. Do not recommend " +
+        "accumulation merely because price moved against the position. " +
+        "Consider trend confirmation, liquidity, volatility, current " +
+        "exposure, invalidation and risk information."
     },
 
 
@@ -240,18 +328,12 @@ function buildQuestions() {
     // --------------------------------------------------------
 
     bullishStructure: {
-      type: "boolean",
+
+      type: "noul",
 
       instructions:
-        "Determine whether the supplied evidence supports bullish market structure.",
-
-      criteria: {
-        true:
-          "The supplied evidence supports a bullish structure.",
-
-        false:
-          "The supplied evidence does not sufficiently support bullish structure."
-      }
+        "Determine whether the supplied evidence supports bullish " +
+        "market structure."
     },
 
 
@@ -260,61 +342,42 @@ function buildQuestions() {
     // --------------------------------------------------------
 
     bearishStructure: {
-      type: "boolean",
+
+      type: "noul",
 
       instructions:
-        "Determine whether the supplied evidence supports bearish market structure.",
-
-      criteria: {
-        true:
-          "The supplied evidence supports a bearish structure.",
-
-        false:
-          "The supplied evidence does not sufficiently support bearish structure."
-      }
+        "Determine whether the supplied evidence supports bearish " +
+        "market structure."
     },
 
 
     // --------------------------------------------------------
-    // EVIDENCE QUALITY
+    // EVIDENCE
     // --------------------------------------------------------
 
     sufficientEvidence: {
-      type: "boolean",
+
+      type: "noul",
 
       instructions:
-        "Determine whether the market information is sufficiently complete, " +
-        "current and internally consistent for meaningful evaluation.",
-
-      criteria: {
-        true:
-          "Important market information is sufficiently complete and usable.",
-
-        false:
-          "Important information is missing, stale, contradictory or unreliable."
-      }
+        "Determine whether the market information is sufficiently " +
+        "complete, current and internally consistent for meaningful " +
+        "evaluation. Missing or stale information should reduce confidence."
     },
 
 
     // --------------------------------------------------------
-    // RISK COMPATIBILITY
+    // RISK
     // --------------------------------------------------------
 
     riskCompatible: {
-      type: "boolean",
+
+      type: "noul",
 
       instructions:
-        "Determine whether the evaluated setup is compatible with the supplied " +
-        "risk information and current exposure. Missing essential risk information " +
-        "must not be treated as acceptable risk.",
-
-      criteria: {
-        true:
-          "The supplied risk information is compatible with the evaluated setup.",
-
-        false:
-          "Risk information is incompatible, insufficient, or materially concerning."
-      }
+        "Determine whether the evaluated setup is compatible with " +
+        "the supplied risk information and current exposure. Missing " +
+        "essential risk information must not be treated as acceptable risk."
     },
 
 
@@ -323,24 +386,20 @@ function buildQuestions() {
     // --------------------------------------------------------
 
     setupQuality: {
+
       type: "score",
 
       instructions:
-        "Rate the overall quality of the supplied trading setup using only " +
-        "the evidence present in the market state. This is a setup-quality " +
-        "assessment, not a probability of profit.",
+        "Rate the overall quality of the supplied trading setup using " +
+        "only evidence present in the market state. This is setup quality, " +
+        "not probability of profit.",
 
       criteria: [
         "No usable setup or critically insufficient information.",
-
         "Very weak setup with major uncertainty or conflicting evidence.",
-
         "Weak setup with important unresolved risks.",
-
         "Moderate setup with meaningful supporting evidence.",
-
         "Strong setup with multiple consistent supporting signals.",
-
         "Very strong setup with highly consistent evidence, adequate liquidity " +
         "and clearly defined invalidation conditions."
       ]
@@ -352,21 +411,19 @@ function buildQuestions() {
     // --------------------------------------------------------
 
     accumulationQuality: {
+
       type: "score",
 
       instructions:
-        "Rate how strongly the supplied evidence supports controlled accumulation. " +
-        "Do not reward averaging down simply because a position is losing.",
+        "Rate how strongly the supplied evidence supports controlled " +
+        "accumulation. Do not reward averaging down merely because a " +
+        "position is losing.",
 
       criteria: [
         "Accumulation is unsupported or inappropriate.",
-
         "Very weak accumulation case with major uncertainty.",
-
         "Weak accumulation case with important unresolved risks.",
-
         "Moderate accumulation case with meaningful confirmation.",
-
         "Strong accumulation case with good confirmation and controlled conditions."
       ]
     },
@@ -377,19 +434,12 @@ function buildQuestions() {
     // --------------------------------------------------------
 
     thesisInvalidated: {
-      type: "boolean",
+
+      type: "noul",
 
       instructions:
         "Determine whether the current trading thesis has been materially " +
-        "invalidated by the supplied market state.",
-
-      criteria: {
-        true:
-          "The current thesis appears materially invalidated.",
-
-        false:
-          "The current thesis does not appear materially invalidated."
-      }
+        "invalidated by the supplied market state."
     },
 
 
@@ -398,21 +448,18 @@ function buildQuestions() {
     // --------------------------------------------------------
 
     reversalRisk: {
+
       type: "score",
 
       instructions:
-        "Rate the current risk of a meaningful reversal against the evaluated " +
-        "direction.",
+        "Rate the current risk of a meaningful reversal against the " +
+        "evaluated direction.",
 
       criteria: [
         "Very low reversal risk.",
-
         "Low reversal risk.",
-
         "Moderate reversal risk.",
-
         "High reversal risk.",
-
         "Very high reversal risk."
       ]
     }
@@ -421,128 +468,186 @@ function buildQuestions() {
 
 
 // ============================================================
-// RESULT HELPERS
+// ANSWER PARSERS
 // ============================================================
 
-function readBoolean(answer) {
+function parseNoul(answer) {
+
   if (
-    !answer ||
-    typeof answer !== "object"
+    !isObject(answer)
   ) {
     return null;
   }
 
-  return typeof answer.probability === "number"
-    ? answer.probability
-    : null;
+
+  // Native OpenRouter / Jev field.
+  if (
+    typeof answer.noul === "number"
+  ) {
+    return clamp01(
+      answer.noul
+    );
+  }
+
+
+  // Compatibility with other Jev adapters.
+  if (
+    typeof answer.probability === "number"
+  ) {
+    return clamp01(
+      answer.probability
+    );
+  }
+
+
+  return null;
 }
 
 
-function readChoice(answer) {
+function parseChoice(answer) {
+
   if (
-    !answer ||
-    typeof answer !== "object"
+    !isObject(answer)
   ) {
     return {
       choice: null,
-      probabilities: {}
+      probabilities: {},
+      confidence: null
     };
   }
 
+
+  const probabilities =
+    isObject(answer.probabilities)
+      ? answer.probabilities
+      : {};
+
+
   return {
+
     choice:
       typeof answer.choice === "string"
         ? answer.choice
         : null,
 
-    probabilities:
-      answer.probabilities &&
-      typeof answer.probabilities === "object"
-        ? answer.probabilities
-        : {}
+    probabilities,
+
+    confidence:
+      clamp01(
+        answer.confidence
+      )
   };
 }
 
 
-function readScore(answer) {
+function parseScore(answer) {
+
   if (
-    !answer ||
-    typeof answer !== "object"
+    !isObject(answer)
   ) {
     return {
       score: null,
-      probabilities: {}
+      probabilities: {},
+      confidence: null
     };
   }
 
-  return {
-    score:
-      typeof answer.score === "number"
-        ? answer.score
-        : null,
 
-    probabilities:
-      answer.probabilities &&
-      typeof answer.probabilities === "object"
-        ? answer.probabilities
-        : {}
+  const probabilities =
+    isObject(answer.probabilities)
+      ? answer.probabilities
+      : {};
+
+
+  return {
+
+    score:
+      safeNumber(
+        answer.score
+      ),
+
+    probabilities,
+
+    confidence:
+      clamp01(
+        answer.confidence
+      )
   };
 }
 
 
 // ============================================================
-// NORMALIZE ANSWERS
+// ANSWER NORMALIZATION
 // ============================================================
 
 function normalizeAnswers(answers) {
-  const direction =
-    readChoice(
-      answers?.direction
+
+  if (
+    !isObject(answers)
+  ) {
+    throw new Error(
+      "Jev response contains no valid answers object"
     );
+  }
+
+
+  const direction =
+    parseChoice(
+      answers.direction
+    );
+
 
   const accumulation =
-    readBoolean(
-      answers?.accumulation
+    parseNoul(
+      answers.accumulation
     );
 
-  const bullish =
-    readBoolean(
-      answers?.bullishStructure
+
+  const bullishStructure =
+    parseNoul(
+      answers.bullishStructure
     );
 
-  const bearish =
-    readBoolean(
-      answers?.bearishStructure
+
+  const bearishStructure =
+    parseNoul(
+      answers.bearishStructure
     );
+
 
   const sufficientEvidence =
-    readBoolean(
-      answers?.sufficientEvidence
+    parseNoul(
+      answers.sufficientEvidence
     );
+
 
   const riskCompatible =
-    readBoolean(
-      answers?.riskCompatible
+    parseNoul(
+      answers.riskCompatible
     );
+
 
   const thesisInvalidated =
-    readBoolean(
-      answers?.thesisInvalidated
+    parseNoul(
+      answers.thesisInvalidated
     );
+
 
   const setupQuality =
-    readScore(
-      answers?.setupQuality
+    parseScore(
+      answers.setupQuality
     );
+
 
   const accumulationQuality =
-    readScore(
-      answers?.accumulationQuality
+    parseScore(
+      answers.accumulationQuality
     );
 
+
   const reversalRisk =
-    readScore(
-      answers?.reversalRisk
+    parseScore(
+      answers.reversalRisk
     );
 
 
@@ -557,22 +662,25 @@ function normalizeAnswers(answers) {
   return {
 
     direction: {
+
       choice:
         selectedDirection,
 
       probabilities:
-        direction.probabilities
+        direction.probabilities,
+
+      confidence:
+        direction.confidence
     },
+
 
     probabilities: {
 
       accumulation,
 
-      bullishStructure:
-        bullish,
+      bullishStructure,
 
-      bearishStructure:
-        bearish,
+      bearishStructure,
 
       sufficientEvidence,
 
@@ -580,6 +688,7 @@ function normalizeAnswers(answers) {
 
       thesisInvalidated
     },
+
 
     scores: {
 
@@ -592,6 +701,23 @@ function normalizeAnswers(answers) {
       reversalRisk:
         reversalRisk.score
     },
+
+
+    confidence: {
+
+      direction:
+        direction.confidence,
+
+      setupQuality:
+        setupQuality.confidence,
+
+      accumulationQuality:
+        accumulationQuality.confidence,
+
+      reversalRisk:
+        reversalRisk.confidence
+    },
+
 
     probabilityDistributions: {
 
@@ -619,29 +745,41 @@ function analyzeConsistency(
   decision,
   position
 ) {
+
   const warnings = [];
 
 
   // ----------------------------------------------------------
-  // Invalid position transitions
+  // Direction validity
   // ----------------------------------------------------------
 
   if (
-    position.side === "FLAT" &&
-    decision.direction.choice === "HOLD"
+    !VALID_DECISIONS.has(
+      decision.direction.choice
+    )
   ) {
+
     warnings.push(
-      "HOLD was selected while the supplied position is FLAT."
+      "Jev returned an invalid trading decision."
     );
   }
 
 
+  // ----------------------------------------------------------
+  // Flat position checks
+  // ----------------------------------------------------------
+
   if (
     position.side === "FLAT" &&
-    decision.direction.choice === "EXIT"
+    (
+      decision.direction.choice === "HOLD" ||
+      decision.direction.choice === "REDUCE" ||
+      decision.direction.choice === "EXIT"
+    )
   ) {
+
     warnings.push(
-      "EXIT was selected while the supplied position is FLAT."
+      `${decision.direction.choice} was selected while the supplied position is FLAT.`
     );
   }
 
@@ -655,6 +793,7 @@ function analyzeConsistency(
     decision.probabilities.accumulation !== null &&
     decision.probabilities.accumulation >= 0.5
   ) {
+
     warnings.push(
       "Accumulation probability is elevated while the supplied position is FLAT."
     );
@@ -668,10 +807,14 @@ function analyzeConsistency(
   if (
     decision.probabilities.sufficientEvidence !== null &&
     decision.probabilities.sufficientEvidence < 0.5 &&
-    decision.direction.choice !== "WAIT"
+    (
+      decision.direction.choice === "LONG" ||
+      decision.direction.choice === "SHORT"
+    )
   ) {
+
     warnings.push(
-      "A directional decision was selected despite weak evidence sufficiency."
+      "Directional exposure was selected despite insufficient evidence."
     );
   }
 
@@ -682,10 +825,16 @@ function analyzeConsistency(
 
   if (
     decision.probabilities.riskCompatible !== null &&
-    decision.probabilities.riskCompatible < 0.5
+    decision.probabilities.riskCompatible < 0.5 &&
+    (
+      decision.direction.choice === "LONG" ||
+      decision.direction.choice === "SHORT" ||
+      decision.direction.choice === "HOLD"
+    )
   ) {
+
     warnings.push(
-      "Risk compatibility is weak."
+      "Risk compatibility is weak for the selected direction."
     );
   }
 
@@ -697,9 +846,11 @@ function analyzeConsistency(
   if (
     decision.probabilities.thesisInvalidated !== null &&
     decision.probabilities.thesisInvalidated >= 0.5 &&
+    position.side !== "FLAT" &&
     decision.direction.choice !== "EXIT" &&
     decision.direction.choice !== "REDUCE"
   ) {
+
     warnings.push(
       "Thesis invalidation probability is elevated without EXIT or REDUCE."
     );
@@ -707,23 +858,26 @@ function analyzeConsistency(
 
 
   // ----------------------------------------------------------
-  // Long/short conflict
+  // Bull/bear conflict
   // ----------------------------------------------------------
 
   if (
     decision.probabilities.bullishStructure !== null &&
     decision.probabilities.bearishStructure !== null
   ) {
+
     const bullish =
       decision.probabilities.bullishStructure;
 
     const bearish =
       decision.probabilities.bearishStructure;
 
+
     if (
       bullish >= 0.5 &&
       bearish >= 0.5
     ) {
+
       warnings.push(
         "Both bullish and bearish structure probabilities are elevated."
       );
@@ -731,12 +885,202 @@ function analyzeConsistency(
   }
 
 
+  // ----------------------------------------------------------
+  // Directional structure mismatch
+  // ----------------------------------------------------------
+
+  if (
+    decision.direction.choice === "LONG" &&
+    decision.probabilities.bearishStructure !== null &&
+    decision.probabilities.bearishStructure >= 0.75
+  ) {
+
+    warnings.push(
+      "LONG conflicts with strongly elevated bearish-structure probability."
+    );
+  }
+
+
+  if (
+    decision.direction.choice === "SHORT" &&
+    decision.probabilities.bullishStructure !== null &&
+    decision.probabilities.bullishStructure >= 0.75
+  ) {
+
+    warnings.push(
+      "SHORT conflicts with strongly elevated bullish-structure probability."
+    );
+  }
+
+
   return {
+
     consistent:
       warnings.length === 0,
 
     warnings
   };
+}
+
+
+// ============================================================
+// OPENROUTER REQUEST
+// ============================================================
+
+async function requestJev(
+  state,
+  questions
+) {
+
+  const apiKey =
+    typeof process.env.OPENROUTER_API_KEY === "string"
+      ? process.env.OPENROUTER_API_KEY.trim()
+      : "";
+
+
+  if (!apiKey) {
+
+    throw new Error(
+      "OPENROUTER_API_KEY is not configured"
+    );
+  }
+
+
+  const controller =
+    new AbortController();
+
+
+  const timeout =
+    setTimeout(
+      () => controller.abort(),
+      REQUEST_TIMEOUT_MS
+    );
+
+
+  try {
+
+    const response =
+      await fetch(
+        OPENROUTER_URL,
+        {
+
+          method: "POST",
+
+          headers: {
+
+            "Authorization":
+              `Bearer ${apiKey}`,
+
+            "Content-Type":
+              "application/json",
+
+            "HTTP-Referer":
+              "https://jev-connector.onrender.com",
+
+            "X-Title":
+              "Jev Connector"
+          },
+
+          body:
+            JSON.stringify({
+
+              model:
+                JEV_MODEL,
+
+              state,
+
+              questions
+            }),
+
+          signal:
+            controller.signal
+        }
+      );
+
+
+    const responseText =
+      await response.text();
+
+
+    let result;
+
+
+    try {
+
+      result =
+        responseText
+          ? JSON.parse(responseText)
+          : {};
+
+    } catch {
+
+      throw new Error(
+        `OpenRouter returned invalid JSON (HTTP ${response.status})`
+      );
+    }
+
+
+    if (
+      !response.ok
+    ) {
+
+      const providerMessage =
+        result?.error?.message ||
+        result?.error ||
+        result?.message ||
+        `HTTP ${response.status}`;
+
+
+      throw new Error(
+        `OpenRouter Jev request failed: ${providerMessage}`
+      );
+    }
+
+
+    if (
+      !isObject(result)
+    ) {
+
+      throw new Error(
+        "OpenRouter Jev returned an invalid response"
+      );
+    }
+
+
+    if (
+      !isObject(result.answers)
+    ) {
+
+      throw new Error(
+        "OpenRouter Jev returned no structured answers"
+      );
+    }
+
+
+    return result;
+
+
+  } catch (error) {
+
+    if (
+      error?.name === "AbortError"
+    ) {
+
+      throw new Error(
+        "OpenRouter Jev request timed out after 20 seconds"
+      );
+    }
+
+
+    throw error;
+
+
+  } finally {
+
+    clearTimeout(
+      timeout
+    );
+  }
 }
 
 
@@ -747,11 +1091,16 @@ function analyzeConsistency(
 export async function evaluateMarketState(
   state
 ) {
-  validateState(state);
+
+  validateState(
+    state
+  );
 
 
   const position =
-    normalizePosition(state);
+    normalizePosition(
+      state
+    );
 
 
   const questions =
@@ -767,8 +1116,10 @@ export async function evaluateMarketState(
     market:
       state,
 
+
     currentPosition:
       position,
+
 
     environment: {
 
@@ -821,7 +1172,7 @@ export async function evaluateMarketState(
 
       "Do not force a trade.",
 
-      "WAIT is a valid result.",
+      "WAIT is a valid decision.",
 
       "Accumulation must not become uncontrolled averaging.",
 
@@ -831,7 +1182,11 @@ export async function evaluateMarketState(
 
       "A setup score is not a profit probability.",
 
-      "Jev does not authorize execution."
+      "Jev does not authorize execution.",
+
+      "Risk controls have authority over Jev.",
+
+      "If evidence is contradictory, prefer WAIT or risk reduction."
     ]
   };
 
@@ -841,36 +1196,25 @@ export async function evaluateMarketState(
   // ----------------------------------------------------------
 
   const result =
-    await evaluate({
-
-      model:
-        JEV_MODEL,
-
-      state:
-        evaluationState,
-
-      questions,
-
-      providerOptions: {
-
-        gateway: {
-
-          zeroDataRetention:
-            true
-        }
-      }
-    });
+    await requestJev(
+      evaluationState,
+      questions
+    );
 
 
   // ----------------------------------------------------------
-  // Normalize response
+  // Normalize
   // ----------------------------------------------------------
 
   const decision =
     normalizeAnswers(
-      result?.answers || {}
+      result.answers
     );
 
+
+  // ----------------------------------------------------------
+  // Consistency
+  // ----------------------------------------------------------
 
   const consistency =
     analyzeConsistency(
@@ -879,16 +1223,31 @@ export async function evaluateMarketState(
     );
 
 
-  const confidence =
-    result
-      ?.providerMetadata
-      ?.typesafe
-      ?.confidence
-      ?? null;
+  // ----------------------------------------------------------
+  // Direction confidence
+  //
+  // Jev's Choice answer provides confidence.
+  // We do NOT invent an "overall confidence" by averaging
+  // unrelated probabilities.
+  // ----------------------------------------------------------
+
+  const directionConfidence =
+    decision.confidence.direction;
 
 
   // ----------------------------------------------------------
-  // Return structured result
+  // Provider/model information
+  // ----------------------------------------------------------
+
+  const resolvedModel =
+    typeof result.model === "string" &&
+    result.model.length > 0
+      ? result.model
+      : JEV_MODEL;
+
+
+  // ----------------------------------------------------------
+  // Return
   // ----------------------------------------------------------
 
   return {
@@ -901,8 +1260,13 @@ export async function evaluateMarketState(
       version:
         ENGINE_VERSION,
 
-      model:
-        JEV_MODEL
+      provider:
+        "openrouter",
+
+      requestedModel:
+        JEV_MODEL,
+
+      resolvedModel
     },
 
 
@@ -912,11 +1276,21 @@ export async function evaluateMarketState(
     decision,
 
 
-    confidence,
+    confidence: {
+
+      direction:
+        directionConfidence
+    },
 
 
     usage:
-      result?.usage ?? null,
+      result.usage ??
+      null,
+
+
+    providerRequestId:
+      result.id ??
+      null,
 
 
     consistency,
@@ -929,7 +1303,7 @@ export async function evaluateMarketState(
 
       reason:
         "Jev is evaluation-only. " +
-        "A separate Risk Engine must approve any future action."
+        "A separate Trader Risk Engine must approve any future action."
     },
 
 
@@ -945,6 +1319,9 @@ export async function evaluateMarketState(
         false,
 
       execution:
+        false,
+
+      exchangePermissionChanges:
         false
     },
 
@@ -953,3 +1330,12 @@ export async function evaluateMarketState(
       new Date().toISOString()
   };
 }
+
+
+// ============================================================
+// OPTIONAL DEFAULT EXPORT
+// ============================================================
+
+export default {
+  evaluateMarketState
+};
