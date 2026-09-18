@@ -1,47 +1,56 @@
-// Jev Trader
-// Market Data Engine V2.0.0
+// ============================================================
+// JEV CONNECTOR
+// MARKET DATA ENGINE V2.1.0
+// ============================================================
 //
-// PURPOSE:
-// - Real-time crypto market data
-// - REST + WebSocket architecture
-// - Price / candles
-// - Order-book depth
-// - Bid/ask spread
-// - Order-book imbalance
-// - Trade flow
-// - Volume
-// - Volatility
-// - Funding
-// - Mark price
-// - Index price
-// - Open interest
-// - Long/short positioning
-// - Taker buy/sell flow
-// - Market regime
-// - Data freshness
-// - Abnormal-market detection
+// Provider:
+//   Binance USD-M Futures public market data
 //
-// IMPORTANT:
+// Purpose:
+//   - REST + WebSocket market data
+//   - Price / candles
+//   - Order-book depth and metrics
+//   - Bid/ask spread
+//   - Trade flow
+//   - Volume
+//   - Volatility
+//   - Funding / mark / index price
+//   - Open interest
+//   - Long/short positioning
+//   - Taker buy/sell flow
+//   - Market regime
+//   - Data freshness
+//   - Abnormal-market detection
+//   - Partial-data protection
+//
+// SECURITY BOUNDARY
+// -----------------
 // This module ONLY supplies market data.
 //
-// It does NOT:
-// - place trades
-// - access wallets
-// - access private keys
-// - withdraw funds
-// - decide trades
+// It NEVER:
+//   - places trades
+//   - accesses wallets
+//   - accesses private keys
+//   - withdraws funds
+//   - changes exchange permissions
+//   - decides trades
 //
-// Jev decides.
+// Jev evaluates.
 // Trader Engine applies risk.
 // Execution Adapter eventually sends orders.
 //
-// MARKET:
-// Binance USD-M Futures public market data.
-//
-// V2 is intentionally designed for LONG/SHORT trading.
+// ============================================================
 
-const MODULE_NAME = "Jev Market Data";
-const MODULE_VERSION = "2.0.0";
+
+// ============================================================
+// CONFIGURATION
+// ============================================================
+
+const MODULE_NAME =
+  "Jev Market Data";
+
+const MODULE_VERSION =
+  "2.2.0";
 
 const REST_BASE_URL =
   process.env.MARKET_DATA_BASE_URL ||
@@ -51,28 +60,83 @@ const WS_BASE_URL =
   process.env.MARKET_DATA_WS_URL ||
   "wss://fstream.binance.com/stream";
 
-const REQUEST_TIMEOUT_MS = 10_000;
+const REQUEST_TIMEOUT_MS =
+  Number.isFinite(Number(process.env.MARKET_DATA_TIMEOUT_MS))
+    ? Math.max(
+        1_000,
+        Math.min(
+          60_000,
+          Number(process.env.MARKET_DATA_TIMEOUT_MS)
+        )
+      )
+    : 10_000;
 
-const DEFAULT_CANDLE_LIMIT = 200;
-const DEFAULT_DEPTH_LIMIT = 20;
-const MAX_CANDLE_LIMIT = 1000;
+const DEFAULT_CANDLE_LIMIT =
+  200;
 
-const VALID_INTERVALS = new Set([
-  "1m",
-  "3m",
-  "5m",
-  "15m",
-  "30m",
-  "1h",
-  "2h",
-  "4h",
-  "6h",
-  "8h",
-  "12h",
-  "1d"
-]);
+const DEFAULT_DEPTH_LIMIT =
+  20;
 
-const memory = new Map();
+const DEFAULT_TRADE_LIMIT =
+  100;
+
+const MAX_CANDLE_LIMIT =
+  1000;
+
+const MAX_RESPONSE_BYTES =
+  5_000_000;
+
+const DEFAULT_FRESHNESS_SECONDS =
+  Number.isFinite(Number(process.env.MARKET_DATA_FRESHNESS_SECONDS))
+    ? Math.max(
+        1,
+        Math.min(300, Number(process.env.MARKET_DATA_FRESHNESS_SECONDS))
+      )
+    : 30;
+
+const MAX_WS_SYMBOLS =
+  100;
+
+const MAX_WS_STREAMS =
+  500;
+
+const MAX_HTTP_RETRIES =
+  2;
+
+const RETRY_BASE_DELAY_MS =
+  350;
+
+const VALID_INTERVALS =
+  new Set([
+    "1m",
+    "3m",
+    "5m",
+    "15m",
+    "30m",
+    "1h",
+    "2h",
+    "4h",
+    "6h",
+    "8h",
+    "12h",
+    "1d"
+  ]);
+
+const VALID_RATIO_PERIODS =
+  new Set([
+    "5m",
+    "15m",
+    "30m",
+    "1h",
+    "2h",
+    "4h"
+  ]);
+
+const memory =
+  new Map();
+
+const inFlightMarketStates =
+  new Map();
 
 const websocketState = {
   socket: null,
@@ -81,21 +145,30 @@ const websocketState = {
   reconnectTimer: null,
   reconnectAttempts: 0,
   streams: new Set(),
+  symbols: [],
   lastMessageAt: 0,
-  lastError: null
+  lastError: null,
+  lastConnectedAt: 0,
+  manualDisconnect: false,
+  lastHeartbeatAt: 0,
+  lastReconnectAt: 0,
+  socketGeneration: 0
 };
 
-/* =========================================================
-   BASIC HELPERS
-   ========================================================= */
+
+// ============================================================
+// BASIC HELPERS
+// ============================================================
 
 function numberOrNull(value) {
-  const number = Number(value);
+  const number =
+    Number(value);
 
   return Number.isFinite(number)
     ? number
     : null;
 }
+
 
 function positiveNumberOrNull(value) {
   const number =
@@ -110,6 +183,7 @@ function positiveNumberOrNull(value) {
 
   return number;
 }
+
 
 function normalizeSymbol(symbol) {
   if (
@@ -138,85 +212,266 @@ function normalizeSymbol(symbol) {
   return normalized;
 }
 
+
 function streamSymbol(symbol) {
   return normalizeSymbol(symbol)
     .toLowerCase();
 }
 
+
 function now() {
   return Date.now();
 }
 
+
 function iso(timestamp = now()) {
-  return new Date(
-    timestamp
-  ).toISOString();
+  const value =
+    Number(timestamp);
+
+  return Number.isFinite(value)
+    ? new Date(value).toISOString()
+    : null;
 }
 
-/* =========================================================
-   HTTP
-   ========================================================= */
+
+function byteLength(value) {
+  try {
+    return Buffer.byteLength(
+      value,
+      "utf8"
+    );
+  } catch {
+    return new TextEncoder()
+      .encode(value)
+      .length;
+  }
+}
+
+
+function clamp(
+  value,
+  minimum,
+  maximum
+) {
+  const number =
+    numberOrNull(value);
+
+  if (number === null) {
+    return null;
+  }
+
+  return Math.min(
+    maximum,
+    Math.max(
+      minimum,
+      number
+    )
+  );
+}
+
+
+function safeLimit(
+  value,
+  fallback,
+  maximum
+) {
+  const number =
+    Number(value);
+
+  if (
+    !Number.isFinite(number)
+  ) {
+    return fallback;
+  }
+
+  return Math.min(
+    maximum,
+    Math.max(
+      1,
+      Math.floor(number)
+    )
+  );
+}
+
+
+function safePeriod(period) {
+  return VALID_RATIO_PERIODS.has(period)
+    ? period
+    : "5m";
+}
+
+
+function safeInterval(interval) {
+  return VALID_INTERVALS.has(interval)
+    ? interval
+    : "5m";
+}
+
+
+function ageSeconds(timestamp) {
+  const value =
+    numberOrNull(timestamp);
+
+  if (
+    value === null ||
+    value <= 0
+  ) {
+    return null;
+  }
+
+  return Math.max(
+    0,
+    (now() - value) / 1000
+  );
+}
+
+
+// ============================================================
+// HTTP
+// ============================================================
+
+async function sleep(ms) {
+  await new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function retryDelayMs(attempt, retryAfterHeader) {
+  const retryAfter =
+    Number(retryAfterHeader);
+
+  if (Number.isFinite(retryAfter) && retryAfter >= 0) {
+    return Math.min(10_000, retryAfter * 1_000);
+  }
+
+  return Math.min(
+    5_000,
+    RETRY_BASE_DELAY_MS * Math.pow(2, attempt)
+  );
+}
 
 async function fetchJson(
   url,
   timeoutMs = REQUEST_TIMEOUT_MS
 ) {
-  const controller =
-    new AbortController();
+  let lastError = null;
 
-  const timeout =
-    setTimeout(
-      () => controller.abort(),
-      timeoutMs
-    );
+  for (let attempt = 0; attempt <= MAX_HTTP_RETRIES; attempt++) {
+    const controller =
+      new AbortController();
 
-  try {
-    const response =
-      await fetch(
-        url,
-        {
-          method: "GET",
-          headers: {
-            accept:
-              "application/json"
-          },
-          signal:
-            controller.signal
-        }
+    const timeout =
+      setTimeout(
+        () => controller.abort(),
+        timeoutMs
       );
 
-    if (
-      !response.ok
-    ) {
-      throw new Error(
-        `Market data request failed with HTTP ${response.status}.`
+    try {
+      const response =
+        await fetch(
+          url,
+          {
+            method: "GET",
+            headers: {
+              accept: "application/json",
+              "user-agent": "Jev-Market-Data/2.2"
+            },
+            signal: controller.signal
+          }
+        );
+
+      const text =
+        await response.text();
+
+      if (byteLength(text) > MAX_RESPONSE_BYTES) {
+        throw new Error(
+          "Market data response is too large."
+        );
+      }
+
+      let data;
+
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch {
+        throw new Error(
+          `Market data returned invalid JSON (HTTP ${response.status}).`
+        );
+      }
+
+      if (!response.ok) {
+        const apiMessage =
+          data?.msg ||
+          data?.message ||
+          data?.error ||
+          `HTTP ${response.status}`;
+
+        const error =
+          new Error(
+            `Market data request failed: ${apiMessage}`
+          );
+
+        error.status = response.status;
+        error.rateLimit = response.headers.get("x-mbx-used-weight-1m");
+        error.retryAfter = response.headers.get("retry-after");
+        error.retryable =
+          response.status === 429 ||
+          response.status === 418 ||
+          response.status >= 500;
+
+        throw error;
+      }
+
+      return {
+        data,
+        status: response.status,
+        rateLimitUsed: response.headers.get("x-mbx-used-weight-1m")
+      };
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        lastError = new Error(
+          `Market data request timed out after ${timeoutMs} ms.`
+        );
+        lastError.retryable = true;
+      } else {
+        lastError = error;
+      }
+
+      const retryable =
+        lastError?.retryable === true ||
+        lastError?.status === 429 ||
+        lastError?.status === 418 ||
+        lastError?.status >= 500;
+
+      if (!retryable || attempt >= MAX_HTTP_RETRIES) {
+        throw lastError;
+      }
+
+      await sleep(
+        retryDelayMs(
+          attempt,
+          lastError?.retryAfter
+        )
       );
+    } finally {
+      clearTimeout(timeout);
     }
-
-    return await response.json();
-  } catch (error) {
-    if (
-      error?.name ===
-      "AbortError"
-    ) {
-      throw new Error(
-        "Market data request timed out."
-      );
-    }
-
-    throw error;
-  } finally {
-    clearTimeout(timeout);
   }
+
+  throw lastError || new Error("Market data request failed.");
 }
 
 async function rest(
   path,
   params = {}
 ) {
+  const base =
+    REST_BASE_URL.endsWith("/")
+      ? REST_BASE_URL
+      : `${REST_BASE_URL}/`;
+
   const url =
     new URL(
-      `${REST_BASE_URL}${path}`
+      path.replace(/^\//, ""),
+      base
     );
 
   for (
@@ -234,14 +489,49 @@ async function rest(
     }
   }
 
-  return fetchJson(
-    url.toString()
-  );
+  const result =
+    await fetchJson(
+      url.toString()
+    );
+
+  return result.data;
 }
 
-/* =========================================================
-   24H TICKER
-   ========================================================= */
+
+async function tryRest(
+  name,
+  fn
+) {
+  try {
+    return {
+      ok: true,
+      data: await fn(),
+      error: null
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      data: null,
+      error: {
+        source:
+          name,
+
+        message:
+          error?.message ||
+          "Unknown market-data error",
+
+        status:
+          error?.status ??
+          null
+      }
+    };
+  }
+}
+
+
+// ============================================================
+// 24H TICKER
+// ============================================================
 
 export async function getTicker(
   symbol
@@ -316,14 +606,18 @@ export async function getTicker(
     timestamp:
       iso(),
 
+    timestampMs:
+      now(),
+
     source:
       "binance-usdm-futures"
   };
 }
 
-/* =========================================================
-   CANDLES
-   ========================================================= */
+
+// ============================================================
+// CANDLES
+// ============================================================
 
 export async function getCandles(
   symbol,
@@ -333,21 +627,15 @@ export async function getCandles(
   const normalized =
     normalizeSymbol(symbol);
 
-  if (
-    !VALID_INTERVALS.has(
-      interval
-    )
-  ) {
-    throw new Error(
-      `Unsupported candle interval: ${interval}`
-    );
-  }
+  const safeIntervalValue =
+    safeInterval(interval);
 
-  const safeLimit =
+  const safeLimitValue =
     Math.min(
-      Math.max(
-        Number(limit) || DEFAULT_CANDLE_LIMIT,
-        1
+      safeLimit(
+        limit,
+        DEFAULT_CANDLE_LIMIT,
+        MAX_CANDLE_LIMIT
       ),
       MAX_CANDLE_LIMIT
     );
@@ -359,10 +647,11 @@ export async function getCandles(
         symbol:
           normalized,
 
-        interval,
+        interval:
+          safeIntervalValue,
 
         limit:
-          safeLimit
+          safeLimitValue
       }
     );
 
@@ -377,72 +666,56 @@ export async function getCandles(
   return data.map(
     candle => ({
       openTime:
-        Number(candle[0]),
+        numberOrNull(candle[0]),
 
       openTimeISO:
-        iso(
-          Number(candle[0])
-        ),
+        iso(candle[0]),
 
       open:
-        positiveNumberOrNull(
-          candle[1]
-        ),
+        positiveNumberOrNull(candle[1]),
 
       high:
-        positiveNumberOrNull(
-          candle[2]
-        ),
+        positiveNumberOrNull(candle[2]),
 
       low:
-        positiveNumberOrNull(
-          candle[3]
-        ),
+        positiveNumberOrNull(candle[3]),
 
       close:
-        positiveNumberOrNull(
-          candle[4]
-        ),
+        positiveNumberOrNull(candle[4]),
 
       volume:
-        positiveNumberOrNull(
-          candle[5]
-        ),
+        positiveNumberOrNull(candle[5]),
 
       closeTime:
-        Number(candle[6]),
+        numberOrNull(candle[6]),
 
       closeTimeISO:
-        iso(
-          Number(candle[6])
-        ),
+        iso(candle[6]),
 
       quoteVolume:
-        positiveNumberOrNull(
-          candle[7]
-        ),
+        positiveNumberOrNull(candle[7]),
 
       trades:
-        numberOrNull(
-          candle[8]
-        ),
+        numberOrNull(candle[8]),
 
       takerBuyBaseVolume:
-        positiveNumberOrNull(
-          candle[9]
-        ),
+        positiveNumberOrNull(candle[9]),
 
       takerBuyQuoteVolume:
-        positiveNumberOrNull(
-          candle[10]
-        )
+        positiveNumberOrNull(candle[10]),
+
+      closed:
+        numberOrNull(candle[6]) !== null
+          ? Number(candle[6]) < now()
+          : null
     })
   );
 }
 
-/* =========================================================
-   ORDER BOOK
-   ========================================================= */
+
+// ============================================================
+// ORDER BOOK
+// ============================================================
 
 export async function getOrderBook(
   symbol,
@@ -465,7 +738,7 @@ export async function getOrderBook(
   const requested =
     Number(limit);
 
-  const safeLimit =
+  const safeDepth =
     allowedLimits.has(
       requested
     )
@@ -480,42 +753,42 @@ export async function getOrderBook(
           normalized,
 
         limit:
-          safeLimit
+          safeDepth
       }
     );
 
   const bids =
     Array.isArray(data.bids)
-      ? data.bids.map(
-          row => ({
+      ? data.bids
+          .map(row => ({
             price:
-              positiveNumberOrNull(
-                row[0]
-              ),
+              positiveNumberOrNull(row[0]),
 
             quantity:
-              positiveNumberOrNull(
-                row[1]
-              )
-          })
-        )
+              positiveNumberOrNull(row[1])
+          }))
+          .filter(
+            row =>
+              row.price !== null &&
+              row.quantity !== null
+          )
       : [];
 
   const asks =
     Array.isArray(data.asks)
-      ? data.asks.map(
-          row => ({
+      ? data.asks
+          .map(row => ({
             price:
-              positiveNumberOrNull(
-                row[0]
-              ),
+              positiveNumberOrNull(row[0]),
 
             quantity:
-              positiveNumberOrNull(
-                row[1]
-              )
-          })
-        )
+              positiveNumberOrNull(row[1])
+          }))
+          .filter(
+            row =>
+              row.price !== null &&
+              row.quantity !== null
+          )
       : [];
 
   return {
@@ -531,52 +804,78 @@ export async function getOrderBook(
     asks,
 
     timestamp:
-      iso()
+      iso(),
+
+    timestampMs:
+      now()
   };
 }
 
-/* =========================================================
-   BOOK METRICS
-   ========================================================= */
+
+// ============================================================
+// BOOK METRICS
+// ============================================================
 
 export function calculateOrderBookMetrics(
   orderBook
 ) {
   const bids =
-    Array.isArray(
-      orderBook?.bids
-    )
+    Array.isArray(orderBook?.bids)
       ? orderBook.bids
       : [];
 
   const asks =
-    Array.isArray(
-      orderBook?.asks
-    )
+    Array.isArray(orderBook?.asks)
       ? orderBook.asks
       : [];
 
+  const validBids =
+    bids.filter(
+      level =>
+        numberOrNull(level?.price) !== null &&
+        numberOrNull(level?.quantity) !== null
+    );
+
+  const validAsks =
+    asks.filter(
+      level =>
+        numberOrNull(level?.price) !== null &&
+        numberOrNull(level?.quantity) !== null
+    );
+
   const bestBid =
-    bids[0]?.price ??
-    null;
+    validBids.length > 0
+      ? Math.max(
+          ...validBids.map(
+            level =>
+              Number(level.price)
+          )
+        )
+      : null;
 
   const bestAsk =
-    asks[0]?.price ??
-    null;
+    validAsks.length > 0
+      ? Math.min(
+          ...validAsks.map(
+            level =>
+              Number(level.price)
+          )
+        )
+      : null;
 
   const bidQuantity =
-    bids.reduce(
+    validBids.reduce(
       (total, level) =>
         total +
-        (level.quantity ?? 0),
+        Number(level.quantity),
       0
     );
 
   const askQuantity =
-    asks.reduce(
+    validAsks.reduce(
       (total, level) =>
         total +
-        (level.quantity ?? 0),
+        Number(level.quantity),
       0
     );
 
@@ -605,11 +904,15 @@ export function calculateOrderBookMetrics(
   const spread =
     bestBid !== null &&
     bestAsk !== null
-      ? bestAsk - bestBid
+      ? Math.max(
+          0,
+          bestAsk -
+          bestBid
+        )
       : null;
 
   const spreadBps =
-    midPrice &&
+    midPrice !== null &&
     midPrice > 0 &&
     spread !== null
       ? (
@@ -620,20 +923,35 @@ export function calculateOrderBookMetrics(
 
   return {
     bestBid,
+
     bestAsk,
+
     midPrice,
+
     spread,
+
     spreadBps,
+
     bidQuantity,
+
     askQuantity,
+
     totalDepth,
-    imbalance
+
+    imbalance,
+
+    bidLevels:
+      validBids.length,
+
+    askLevels:
+      validAsks.length
   };
 }
 
-/* =========================================================
-   BOOK TICKER
-   ========================================================= */
+
+// ============================================================
+// BOOK TICKER
+// ============================================================
 
 export async function getBookTicker(
   symbol
@@ -680,27 +998,29 @@ export async function getBookTicker(
       null,
 
     timestamp:
-      iso()
+      iso(),
+
+    timestampMs:
+      now()
   };
 }
 
-/* =========================================================
-   TRADES
-   ========================================================= */
+
+// ============================================================
+// RECENT TRADES
+// ============================================================
 
 export async function getRecentTrades(
   symbol,
-  limit = 100
+  limit = DEFAULT_TRADE_LIMIT
 ) {
   const normalized =
     normalizeSymbol(symbol);
 
-  const safeLimit =
-    Math.min(
-      Math.max(
-        Number(limit) || 100,
-        1
-      ),
+  const safeTradeLimit =
+    safeLimit(
+      limit,
+      DEFAULT_TRADE_LIMIT,
       1000
     );
 
@@ -712,7 +1032,7 @@ export async function getRecentTrades(
           normalized,
 
         limit:
-          safeLimit
+          safeTradeLimit
       }
     );
 
@@ -727,7 +1047,7 @@ export async function getRecentTrades(
   return data.map(
     trade => ({
       id:
-        trade.id,
+        trade.id ?? null,
 
       price:
         positiveNumberOrNull(
@@ -745,12 +1065,12 @@ export async function getRecentTrades(
         ),
 
       timestamp:
-        Number(trade.time),
+        numberOrNull(
+          trade.time
+        ),
 
       timestampISO:
-        iso(
-          Number(trade.time)
-        ),
+        iso(trade.time),
 
       buyerMaker:
         Boolean(
@@ -760,9 +1080,10 @@ export async function getRecentTrades(
   );
 }
 
-/* =========================================================
-   TRADE FLOW
-   ========================================================= */
+
+// ============================================================
+// TRADE FLOW
+// ============================================================
 
 export function calculateTradeFlow(
   trades
@@ -772,18 +1093,33 @@ export function calculateTradeFlow(
     trades.length === 0
   ) {
     return {
-      sufficientData: false
+      sufficientData:
+        false,
+
+      reason:
+        "No recent trades available."
     };
   }
 
   let buyVolume = 0;
   let sellVolume = 0;
+  let validTrades = 0;
 
   for (
     const trade of trades
   ) {
     const quantity =
-      trade.quantity ?? 0;
+      positiveNumberOrNull(
+        trade?.quantity
+      );
+
+    if (
+      quantity === null
+    ) {
+      continue;
+    }
+
+    validTrades += 1;
 
     if (
       trade.buyerMaker
@@ -792,6 +1128,18 @@ export function calculateTradeFlow(
     } else {
       buyVolume += quantity;
     }
+  }
+
+  if (
+    validTrades === 0
+  ) {
+    return {
+      sufficientData:
+        false,
+
+      reason:
+        "Recent trades contained no valid quantities."
+    };
   }
 
   const totalVolume =
@@ -815,7 +1163,11 @@ export function calculateTradeFlow(
     sellVolume;
 
   return {
-    sufficientData: true,
+    sufficientData:
+      true,
+
+    tradeCount:
+      validTrades,
 
     buyVolume,
 
@@ -838,9 +1190,10 @@ export function calculateTradeFlow(
   };
 }
 
-/* =========================================================
-   FUTURES PREMIUM / FUNDING
-   ========================================================= */
+
+// ============================================================
+// FUTURES PREMIUM / FUNDING
+// ============================================================
 
 export async function getPremiumIndex(
   symbol
@@ -882,16 +1235,27 @@ export async function getPremiumIndex(
         data.nextFundingTime
       ),
 
+    nextFundingTimeISO:
+      iso(
+        data.nextFundingTime
+      ),
+
     timestamp:
       numberOrNull(
+        data.time
+      ),
+
+    timestampISO:
+      iso(
         data.time
       )
   };
 }
 
-/* =========================================================
-   OPEN INTEREST
-   ========================================================= */
+
+// ============================================================
+// OPEN INTEREST
+// ============================================================
 
 export async function getOpenInterest(
   symbol
@@ -921,13 +1285,19 @@ export async function getOpenInterest(
     timestamp:
       numberOrNull(
         data.time
+      ),
+
+    timestampISO:
+      iso(
+        data.time
       )
   };
 }
 
-/* =========================================================
-   LONG / SHORT RATIO
-   ========================================================= */
+
+// ============================================================
+// LONG / SHORT RATIO
+// ============================================================
 
 export async function getLongShortRatio(
   symbol,
@@ -938,23 +1308,19 @@ export async function getLongShortRatio(
     normalizeSymbol(symbol);
 
   const pair =
-    normalized.endsWith(
-      "USDT"
-    )
-      ? normalized.slice(
-          0,
-          -4
-        )
+    normalized.endsWith("USDT")
+      ? normalized.slice(0, -4)
       : normalized;
 
-  const safeLimit =
-    Math.min(
-      Math.max(
-        Number(limit) || 30,
-        1
-      ),
+  const safeLimitValue =
+    safeLimit(
+      limit,
+      30,
       500
     );
+
+  const safePeriodValue =
+    safePeriod(period);
 
   const data =
     await rest(
@@ -962,10 +1328,11 @@ export async function getLongShortRatio(
       {
         pair,
 
-        period,
+        period:
+          safePeriodValue,
 
         limit:
-          safeLimit
+          safeLimitValue
       }
     );
 
@@ -1002,20 +1369,17 @@ export async function getLongShortRatio(
         ),
 
       timestampISO:
-        row.timestamp
-          ? iso(
-              Number(
-                row.timestamp
-              )
-            )
-          : null
+        iso(
+          row.timestamp
+        )
     })
   );
 }
 
-/* =========================================================
-   OPEN INTEREST HISTORY
-   ========================================================= */
+
+// ============================================================
+// OPEN INTEREST HISTORY
+// ============================================================
 
 export async function getOpenInterestHistory(
   symbol,
@@ -1026,23 +1390,19 @@ export async function getOpenInterestHistory(
     normalizeSymbol(symbol);
 
   const pair =
-    normalized.endsWith(
-      "USDT"
-    )
-      ? normalized.slice(
-          0,
-          -4
-        )
+    normalized.endsWith("USDT")
+      ? normalized.slice(0, -4)
       : normalized;
 
-  const safeLimit =
-    Math.min(
-      Math.max(
-        Number(limit) || 30,
-        1
-      ),
+  const safeLimitValue =
+    safeLimit(
+      limit,
+      30,
       500
     );
+
+  const safePeriodValue =
+    safePeriod(period);
 
   const data =
     await rest(
@@ -1053,10 +1413,11 @@ export async function getOpenInterestHistory(
         contractType:
           "PERPETUAL",
 
-        period,
+        period:
+          safePeriodValue,
 
         limit:
-          safeLimit
+          safeLimitValue
       }
     );
 
@@ -1088,20 +1449,17 @@ export async function getOpenInterestHistory(
         ),
 
       timestampISO:
-        row.timestamp
-          ? iso(
-              Number(
-                row.timestamp
-              )
-            )
-          : null
+        iso(
+          row.timestamp
+        )
     })
   );
 }
 
-/* =========================================================
-   TAKER BUY / SELL VOLUME
-   ========================================================= */
+
+// ============================================================
+// TAKER BUY / SELL VOLUME
+// ============================================================
 
 export async function getTakerVolume(
   symbol,
@@ -1112,23 +1470,19 @@ export async function getTakerVolume(
     normalizeSymbol(symbol);
 
   const pair =
-    normalized.endsWith(
-      "USDT"
-    )
-      ? normalized.slice(
-          0,
-          -4
-        )
+    normalized.endsWith("USDT")
+      ? normalized.slice(0, -4)
       : normalized;
 
-  const safeLimit =
-    Math.min(
-      Math.max(
-        Number(limit) || 30,
-        1
-      ),
+  const safeLimitValue =
+    safeLimit(
+      limit,
+      30,
       500
     );
+
+  const safePeriodValue =
+    safePeriod(period);
 
   const data =
     await rest(
@@ -1137,10 +1491,11 @@ export async function getTakerVolume(
         symbol:
           normalized,
 
-        period,
+        period:
+          safePeriodValue,
 
         limit:
-          safeLimit
+          safeLimitValue
       }
     );
 
@@ -1153,6 +1508,9 @@ export async function getTakerVolume(
   return data.map(
     row => ({
       pair,
+
+      symbol:
+        normalized,
 
       buySellRatio:
         numberOrNull(
@@ -1175,20 +1533,17 @@ export async function getTakerVolume(
         ),
 
       timestampISO:
-        row.timestamp
-          ? iso(
-              Number(
-                row.timestamp
-              )
-            )
-          : null
+        iso(
+          row.timestamp
+        )
     })
   );
 }
 
-/* =========================================================
-   VOLATILITY
-   ========================================================= */
+
+// ============================================================
+// VOLATILITY
+// ============================================================
 
 export function calculateVolatility(
   candles
@@ -1198,31 +1553,38 @@ export function calculateVolatility(
     candles.length < 3
   ) {
     return {
-      sufficientData: false
+      sufficientData:
+        false,
+
+      reason:
+        "At least 3 candles are required."
+    };
+  }
+
+  const valid =
+    candles.filter(
+      candle =>
+        numberOrNull(candle?.close) !== null &&
+        Number(candle.close) > 0
+    );
+
+  if (
+    valid.length < 3
+  ) {
+    return {
+      sufficientData:
+        false,
+
+      reason:
+        "Not enough valid closing prices."
     };
   }
 
   const closes =
-    candles
-      .map(
-        candle =>
-          numberOrNull(
-            candle.close
-          )
-      )
-      .filter(
-        value =>
-          value !== null &&
-          value > 0
-      );
-
-  if (
-    closes.length < 3
-  ) {
-    return {
-      sufficientData: false
-    };
-  }
+    valid.map(
+      candle =>
+        Number(candle.close)
+    );
 
   const returns = [];
 
@@ -1231,13 +1593,29 @@ export function calculateVolatility(
     i < closes.length;
     i++
   ) {
-    returns.push(
-      (
-        closes[i] -
+    if (
+      closes[i - 1] > 0
+    ) {
+      returns.push(
+        (
+          closes[i] -
+          closes[i - 1]
+        ) /
         closes[i - 1]
-      ) /
-      closes[i - 1]
-    );
+      );
+    }
+  }
+
+  if (
+    returns.length < 2
+  ) {
+    return {
+      sufficientData:
+        false,
+
+      reason:
+        "Not enough valid returns."
+    };
   }
 
   const mean =
@@ -1261,11 +1639,23 @@ export function calculateVolatility(
 
   const standardDeviation =
     Math.sqrt(
-      variance
+      Math.max(
+        0,
+        variance
+      )
     );
 
+  const latestReturn =
+    returns[
+      returns.length - 1
+    ];
+
   return {
-    sufficientData: true,
+    sufficientData:
+      true,
+
+    sampleCount:
+      returns.length,
 
     meanReturn:
       mean,
@@ -1273,14 +1663,122 @@ export function calculateVolatility(
     standardDeviation,
 
     percentageVolatility:
-      standardDeviation *
-      100
+      standardDeviation * 100,
+
+    latestReturn,
+
+    latestReturnPercent:
+      latestReturn * 100
   };
 }
 
-/* =========================================================
-   TREND / MARKET REGIME
-   ========================================================= */
+
+// ============================================================
+// ATR / RANGE METRICS
+// ============================================================
+
+export function calculateRangeMetrics(
+  candles
+) {
+  if (
+    !Array.isArray(candles) ||
+    candles.length < 2
+  ) {
+    return {
+      sufficientData:
+        false
+    };
+  }
+
+  const valid =
+    candles.filter(
+      candle =>
+        numberOrNull(candle?.high) !== null &&
+        numberOrNull(candle?.low) !== null &&
+        numberOrNull(candle?.close) !== null
+    );
+
+  if (
+    valid.length < 2
+  ) {
+    return {
+      sufficientData:
+        false
+    };
+  }
+
+  const trueRanges = [];
+
+  for (
+    let i = 1;
+    i < valid.length;
+    i++
+  ) {
+    const high =
+      Number(valid[i].high);
+
+    const low =
+      Number(valid[i].low);
+
+    const previousClose =
+      Number(valid[i - 1].close);
+
+    trueRanges.push(
+      Math.max(
+        high - low,
+        Math.abs(
+          high -
+          previousClose
+        ),
+        Math.abs(
+          low -
+          previousClose
+        )
+      )
+    );
+  }
+
+  const latestClose =
+    Number(
+      valid[valid.length - 1].close
+    );
+
+  const atr =
+    trueRanges.length > 0
+      ? trueRanges.reduce(
+          (a, b) => a + b,
+          0
+        ) /
+        trueRanges.length
+      : null;
+
+  return {
+    sufficientData:
+      atr !== null,
+
+    averageTrueRange:
+      atr,
+
+    atrPercent:
+      atr !== null &&
+      latestClose > 0
+        ? (
+            atr /
+            latestClose
+          ) * 100
+        : null,
+
+    latestRange:
+      trueRanges[
+        trueRanges.length - 1
+      ] ?? null
+  };
+}
+
+
+// ============================================================
+// TREND / MARKET REGIME
+// ============================================================
 
 export function calculateMarketRegime(
   candles
@@ -1290,8 +1788,14 @@ export function calculateMarketRegime(
     candles.length < 20
   ) {
     return {
-      sufficientData: false,
-      regime: "UNKNOWN"
+      sufficientData:
+        false,
+
+      regime:
+        "UNKNOWN",
+
+      reason:
+        "At least 20 candles are required."
     };
   }
 
@@ -1300,20 +1804,24 @@ export function calculateMarketRegime(
       .map(
         candle =>
           numberOrNull(
-            candle.close
+            candle?.close
           )
       )
       .filter(
         value =>
-          value !== null
+          value !== null &&
+          value > 0
       );
 
   if (
     closes.length < 20
   ) {
     return {
-      sufficientData: false,
-      regime: "UNKNOWN"
+      sufficientData:
+        false,
+
+      regime:
+        "UNKNOWN"
     };
   }
 
@@ -1353,27 +1861,37 @@ export function calculateMarketRegime(
         ) * 100
       : 0;
 
+  const averageGapPercent =
+    longAverage > 0
+      ? (
+          (
+            shortAverage -
+            longAverage
+          ) /
+          longAverage
+        ) * 100
+      : 0;
+
   let regime =
     "RANGE";
 
   if (
-    shortAverage >
-      longAverage &&
+    averageGapPercent > 0 &&
     change > 0
   ) {
-    regime = "BULLISH";
-  }
-
-  if (
-    shortAverage <
-      longAverage &&
+    regime =
+      "BULLISH";
+  } else if (
+    averageGapPercent < 0 &&
     change < 0
   ) {
-    regime = "BEARISH";
+    regime =
+      "BEARISH";
   }
 
   return {
-    sufficientData: true,
+    sufficientData:
+      true,
 
     regime,
 
@@ -1381,14 +1899,17 @@ export function calculateMarketRegime(
 
     longAverage,
 
+    averageGapPercent,
+
     percentageChange:
       change
   };
 }
 
-/* =========================================================
-   ABNORMAL MARKET DETECTION
-   ========================================================= */
+
+// ============================================================
+// ABNORMAL MARKET DETECTION
+// ============================================================
 
 export function detectAbnormalMarket(
   marketState
@@ -1417,6 +1938,13 @@ export function detectAbnormalMarket(
         ?.percentageVolatility
     );
 
+  const atrPercent =
+    numberOrNull(
+      marketState
+        ?.range
+        ?.atrPercent
+    );
+
   if (
     priceChange !== null &&
     Math.abs(priceChange) >= 15
@@ -1440,7 +1968,33 @@ export function detectAbnormalMarket(
     volatility >= 5
   ) {
     warnings.push(
-      "High short-term volatility."
+      "High short-term return volatility."
+    );
+  }
+
+  if (
+    atrPercent !== null &&
+    atrPercent >= 5
+  ) {
+    warnings.push(
+      "High average candle range relative to price."
+    );
+  }
+
+  const realtimeAge =
+    ageSeconds(
+      marketState
+        ?.realtime
+        ?.lastEventAt
+    );
+
+  if (
+    realtimeAge !== null &&
+    realtimeAge >
+      DEFAULT_FRESHNESS_SECONDS
+  ) {
+    warnings.push(
+      "WebSocket market data is stale."
     );
   }
 
@@ -1448,15 +2002,110 @@ export function detectAbnormalMarket(
     abnormal:
       warnings.length > 0,
 
+    warningCount:
+      warnings.length,
+
     warnings
   };
 }
 
-/* =========================================================
-   COMPLETE MARKET STATE
-   ========================================================= */
 
-export async function getMarketState(
+// ============================================================
+// DATA QUALITY / FRESHNESS
+// ============================================================
+
+function assessMarketDataQuality(
+  marketState,
+  sourceResults
+) {
+  const unavailable = [];
+  const stale = [];
+
+  for (const [name, result] of Object.entries(sourceResults)) {
+    if (result && result.ok === false) {
+      unavailable.push({
+        source: name,
+        error: result.error
+      });
+    }
+  }
+
+  const timestampChecks = [
+    ["ticker", marketState?.ticker?.timestampMs],
+    ["orderBook", marketState?.orderBook?.timestampMs],
+    ["bookTicker", marketState?.bookTicker?.timestampMs],
+    ["premium", marketState?.futures?.premium?.timestampMs],
+    ["openInterest", marketState?.futures?.openInterest?.timestampMs]
+  ];
+
+  for (const [name, timestamp] of timestampChecks) {
+    const age = ageSeconds(timestamp);
+
+    if (age !== null && age > DEFAULT_FRESHNESS_SECONDS) {
+      stale.push({
+        source: name,
+        ageSeconds: age
+      });
+    }
+  }
+
+  const availableCount =
+    Object.values(sourceResults)
+      .filter(result => result?.ok === true)
+      .length;
+
+  const totalSources =
+    Object.keys(sourceResults).length;
+
+  const completeness =
+    totalSources > 0
+      ? availableCount / totalSources
+      : 0;
+
+  const criticalSources = [
+    "ticker",
+    "candles",
+    "orderBook",
+    "bookTicker"
+  ];
+
+  const unavailableCritical =
+    criticalSources.filter(
+      name => sourceResults[name]?.ok !== true
+    );
+
+  const staleCritical =
+    stale
+      .filter(item => criticalSources.includes(item.source))
+      .map(item => item.source);
+
+  const usable =
+    completeness >= 0.6 &&
+    unavailableCritical.length === 0 &&
+    staleCritical.length === 0;
+
+  return {
+    sufficientData: usable,
+    usable,
+    completeness,
+    availableSources: availableCount,
+    totalSources,
+    unavailable,
+    stale,
+    staleSources: stale.map(item => item.source),
+    criticalSources,
+    unavailableCritical,
+    staleCritical,
+    freshnessSeconds: DEFAULT_FRESHNESS_SECONDS,
+    evaluatedAt: iso()
+  };
+}
+
+// ============================================================
+// COMPLETE MARKET STATE
+// ============================================================
+
+async function buildMarketState(
   symbol,
   options = {}
 ) {
@@ -1464,61 +2113,170 @@ export async function getMarketState(
     normalizeSymbol(symbol);
 
   const interval =
-    options.interval ??
-    "5m";
+    safeInterval(
+      options.interval ??
+      "5m"
+    );
 
   const limit =
-    options.limit ??
-    DEFAULT_CANDLE_LIMIT;
+    Math.min(
+      safeLimit(
+        options.limit,
+        DEFAULT_CANDLE_LIMIT,
+        MAX_CANDLE_LIMIT
+      ),
+      MAX_CANDLE_LIMIT
+    );
+
+  const depthLimit =
+    options.depthLimit ??
+    DEFAULT_DEPTH_LIMIT;
+
+  const tradeLimit =
+    options.tradeLimit ??
+    DEFAULT_TRADE_LIMIT;
+
+  // ----------------------------------------------------------
+  // Partial failure is intentional.
+  // One unavailable public endpoint should not erase all
+  // other market information. Missing data is reported to Jev.
+  // ----------------------------------------------------------
 
   const [
-    ticker,
-    candles,
-    orderBook,
-    bookTicker,
-    trades,
-    premium,
-    openInterest,
-    longShort
+    tickerResult,
+    candlesResult,
+    orderBookResult,
+    bookTickerResult,
+    tradesResult,
+    premiumResult,
+    openInterestResult,
+    longShortResult,
+    openInterestHistoryResult,
+    takerVolumeResult
   ] = await Promise.all([
-    getTicker(
-      normalized
+    tryRest(
+      "ticker",
+      () =>
+        getTicker(normalized)
     ),
 
-    getCandles(
-      normalized,
-      interval,
-      limit
+    tryRest(
+      "candles",
+      () =>
+        getCandles(
+          normalized,
+          interval,
+          limit
+        )
     ),
 
-    getOrderBook(
-      normalized,
-      DEFAULT_DEPTH_LIMIT
+    tryRest(
+      "orderBook",
+      () =>
+        getOrderBook(
+          normalized,
+          depthLimit
+        )
     ),
 
-    getBookTicker(
-      normalized
+    tryRest(
+      "bookTicker",
+      () =>
+        getBookTicker(normalized)
     ),
 
-    getRecentTrades(
-      normalized,
-      100
+    tryRest(
+      "trades",
+      () =>
+        getRecentTrades(
+          normalized,
+          tradeLimit
+        )
     ),
 
-    getPremiumIndex(
-      normalized
+    tryRest(
+      "premium",
+      () =>
+        getPremiumIndex(normalized)
     ),
 
-    getOpenInterest(
-      normalized
+    tryRest(
+      "openInterest",
+      () =>
+        getOpenInterest(normalized)
     ),
 
-    getLongShortRatio(
-      normalized,
-      "5m",
-      30
+    tryRest(
+      "longShort",
+      () =>
+        getLongShortRatio(
+          normalized,
+          options.ratioPeriod ??
+            "5m",
+          options.ratioLimit ??
+            30
+        )
+    ),
+
+    tryRest(
+      "openInterestHistory",
+      () =>
+        getOpenInterestHistory(
+          normalized,
+          options.openInterestPeriod ??
+            "5m",
+          options.openInterestLimit ??
+            30
+        )
+    ),
+
+    tryRest(
+      "takerVolume",
+      () =>
+        getTakerVolume(
+          normalized,
+          options.takerPeriod ??
+            "5m",
+          options.takerLimit ??
+            30
+        )
     )
   ]);
+
+  const ticker =
+    tickerResult.data;
+
+  const candles =
+    candlesResult.data ??
+    [];
+
+  const orderBook =
+    orderBookResult.data;
+
+  const bookTicker =
+    bookTickerResult.data;
+
+  const trades =
+    tradesResult.data ??
+    [];
+
+  const premium =
+    premiumResult.data;
+
+  const openInterest =
+    openInterestResult.data;
+
+  const longShort =
+    longShortResult.data ??
+    [];
+
+  const openInterestHistory =
+    openInterestHistoryResult.data ??
+    [];
+
+  const takerVolume =
+    takerVolumeResult.data ??
+    [];
 
   const orderBookMetrics =
     calculateOrderBookMetrics(
@@ -1535,6 +2293,11 @@ export async function getMarketState(
       candles
     );
 
+  const range =
+    calculateRangeMetrics(
+      candles
+    );
+
   const regime =
     calculateMarketRegime(
       candles
@@ -1547,16 +2310,34 @@ export async function getMarketState(
     timestamp:
       iso(),
 
+    timestampMs:
+      now(),
+
+    interval,
+
     ticker,
 
     candles,
 
-    orderBook: {
-      ...orderBook,
+    orderBook:
+      orderBook
+        ? {
+            ...orderBook,
 
-      metrics:
-        orderBookMetrics
-    },
+            metrics:
+              orderBookMetrics
+          }
+        : {
+            symbol:
+              normalized,
+
+            bids: [],
+
+            asks: [],
+
+            metrics:
+              orderBookMetrics
+          },
 
     bookTicker,
 
@@ -1569,21 +2350,88 @@ export async function getMarketState(
 
       openInterest,
 
-      longShort
+      longShort,
+
+      openInterestHistory,
+
+      takerVolume
     },
 
     volatility,
 
+    range,
+
     regime
   };
+
+  const sourceResults = {
+    ticker:
+      tickerResult,
+
+    candles:
+      candlesResult,
+
+    orderBook:
+      orderBookResult,
+
+    bookTicker:
+      bookTickerResult,
+
+    trades:
+      tradesResult,
+
+    premium:
+      premiumResult,
+
+    openInterest:
+      openInterestResult,
+
+    longShort:
+      longShortResult,
+
+    openInterestHistory:
+      openInterestHistoryResult,
+
+    takerVolume:
+      takerVolumeResult
+  };
+
+  const quality =
+    assessMarketDataQuality(
+      marketState,
+      sourceResults
+    );
 
   const abnormal =
     detectAbnormalMarket(
       marketState
     );
 
+  marketState.dataQuality =
+    quality;
+
   marketState.abnormalMarket =
     abnormal;
+
+  marketState.sources =
+    Object.fromEntries(
+      Object.entries(
+        sourceResults
+      ).map(
+        ([name, result]) => [
+          name,
+          {
+            available:
+              result.ok,
+
+            error:
+              result.ok
+                ? null
+                : result.error
+          }
+        ]
+      )
+    );
 
   memory.set(
     normalized,
@@ -1593,9 +2441,53 @@ export async function getMarketState(
   return marketState;
 }
 
-/* =========================================================
-   CACHED STATE
-   ========================================================= */
+
+export async function getMarketState(
+  symbol,
+  options = {}
+) {
+  const normalized = normalizeSymbol(symbol);
+
+  const interval = safeInterval(options.interval ?? "5m");
+  const limit = safeLimit(
+    options.limit,
+    DEFAULT_CANDLE_LIMIT,
+    MAX_CANDLE_LIMIT
+  );
+  const key = JSON.stringify({
+    symbol: normalized,
+    interval,
+    limit,
+    depthLimit: options.depthLimit ?? DEFAULT_DEPTH_LIMIT,
+    tradeLimit: options.tradeLimit ?? DEFAULT_TRADE_LIMIT,
+    ratioPeriod: safePeriod(options.ratioPeriod ?? "5m"),
+    ratioLimit: safeLimit(options.ratioLimit, 30, 500),
+    openInterestPeriod: safePeriod(options.openInterestPeriod ?? "5m"),
+    openInterestLimit: safeLimit(options.openInterestLimit, 30, 500),
+    takerPeriod: safePeriod(options.takerPeriod ?? "5m"),
+    takerLimit: safeLimit(options.takerLimit, 30, 500)
+  });
+
+  const existing = inFlightMarketStates.get(key);
+  if (existing) {
+    return existing;
+  }
+
+  const promise = buildMarketState(normalized, options)
+    .finally(() => {
+      if (inFlightMarketStates.get(key) === promise) {
+        inFlightMarketStates.delete(key);
+      }
+    });
+
+  inFlightMarketStates.set(key, promise);
+  return promise;
+}
+
+
+// ============================================================
+// CACHED STATE
+// ============================================================
 
 export function getCachedMarketState(
   symbol
@@ -1611,39 +2503,55 @@ export function getCachedMarketState(
   );
 }
 
-/* =========================================================
-   WEBSOCKET
-   ========================================================= */
+
+export function clearCachedMarketState(
+  symbol
+) {
+  if (
+    symbol === undefined
+  ) {
+    memory.clear();
+    return true;
+  }
+
+  return memory.delete(
+    normalizeSymbol(symbol)
+  );
+}
+
+
+// ============================================================
+// WEBSOCKET
+// ============================================================
 
 function buildStreams(
   symbols
 ) {
+  const normalizedSymbols = [
+    ...new Set(symbols.map(normalizeSymbol))
+  ];
+
+  if (normalizedSymbols.length > MAX_WS_SYMBOLS) {
+    throw new Error(
+      `Too many WebSocket symbols. Maximum is ${MAX_WS_SYMBOLS}.`
+    );
+  }
+
   const streams = [];
 
-  for (
-    const symbol of symbols
-  ) {
-    const s =
-      streamSymbol(symbol);
+  for (const symbol of normalizedSymbols) {
+    const s = streamSymbol(symbol);
 
-    streams.push(
-      `${s}@aggTrade`
-    );
+    streams.push(`${s}@aggTrade`);
+    streams.push(`${s}@depth20@100ms`);
+    streams.push(`${s}@markPrice@1s`);
+    streams.push(`${s}@bookTicker`);
+    streams.push(`${s}@kline_1m`);
+  }
 
-    streams.push(
-      `${s}@depth20@100ms`
-    );
-
-    streams.push(
-      `${s}@markPrice@1s`
-    );
-
-    streams.push(
-      `${s}@bookTicker`
-    );
-
-    streams.push(
-      `${s}@kline_1m`
+  if (streams.length > MAX_WS_STREAMS) {
+    throw new Error(
+      `Too many WebSocket streams. Maximum is ${MAX_WS_STREAMS}.`
     );
   }
 
@@ -1662,13 +2570,48 @@ async function getWebSocketClass() {
     const module =
       await import("ws");
 
-    return module.WebSocket;
+    return (
+      module.WebSocket ??
+      module.default
+    );
   } catch {
     throw new Error(
       "WebSocket support is unavailable. Install the 'ws' package."
     );
   }
 }
+
+
+function attachSocketHandler(
+  socket,
+  event,
+  handler
+) {
+  // WHATWG WebSocket
+  if (
+    typeof socket.addEventListener ===
+    "function"
+  ) {
+    socket.addEventListener(
+      event,
+      handler
+    );
+
+    return;
+  }
+
+  // ws package EventEmitter API
+  if (
+    typeof socket.on ===
+    "function"
+  ) {
+    socket.on(
+      event,
+      handler
+    );
+  }
+}
+
 
 export async function connectMarketStream(
   symbols
@@ -1682,18 +2625,48 @@ export async function connectMarketStream(
     );
   }
 
+  const normalizedSymbols =
+    [
+      ...new Set(
+        symbols.map(
+          normalizeSymbol
+        )
+      )
+    ];
+
   const WebSocketClass =
     await getWebSocketClass();
 
   const streams =
     buildStreams(
-      symbols
+      normalizedSymbols
     );
 
+  websocketState.manualDisconnect =
+    false;
+
+  const generation =
+    websocketState.socketGeneration + 1;
+
+  websocketState.socketGeneration =
+    generation;
+
   websocketState.streams =
-    new Set(
-      streams
+    new Set(streams);
+
+  websocketState.symbols =
+    normalizedSymbols;
+
+  if (
+    websocketState.reconnectTimer
+  ) {
+    clearTimeout(
+      websocketState.reconnectTimer
     );
+
+    websocketState.reconnectTimer =
+      null;
+  }
 
   if (
     websocketState.socket
@@ -1705,8 +2678,13 @@ export async function connectMarketStream(
     }
   }
 
+  const separator =
+    WS_BASE_URL.includes("?")
+      ? "&"
+      : "?";
+
   const url =
-    `${WS_BASE_URL}?streams=${streams.join("/")}`;
+    `${WS_BASE_URL}${separator}streams=${streams.join("/")}`;
 
   websocketState.connecting =
     true;
@@ -1719,8 +2697,12 @@ export async function connectMarketStream(
   websocketState.socket =
     socket;
 
-  socket.onopen =
+  attachSocketHandler(
+    socket,
+    "open",
     () => {
+      if (generation !== websocketState.socketGeneration) return;
+
       websocketState.connected =
         true;
 
@@ -1733,66 +2715,135 @@ export async function connectMarketStream(
       websocketState.lastError =
         null;
 
-      websocketState.lastMessageAt =
+      websocketState.lastConnectedAt =
         now();
-    };
 
-  socket.onmessage =
-    event => {
+      websocketState.lastHeartbeatAt =
+        now();
+
       websocketState.lastMessageAt =
         now();
+    }
+  );
+
+  attachSocketHandler(
+    socket,
+    "message",
+    event => {
+      if (generation !== websocketState.socketGeneration) return;
+
+      websocketState.lastMessageAt =
+        now();
+
+      websocketState.lastHeartbeatAt =
+        now();
+
+      const data =
+        event?.data ??
+        event;
 
       handleWebSocketMessage(
-        event.data
+        data
       );
-    };
+    }
+  );
 
-  socket.onerror =
+  attachSocketHandler(
+    socket,
+    "error",
     error => {
-      websocketState.lastError =
-        "WebSocket error";
-    };
+      if (generation !== websocketState.socketGeneration) return;
 
-  socket.onclose =
+      websocketState.lastError =
+        error?.message ||
+        "WebSocket error";
+    }
+  );
+
+  attachSocketHandler(
+    socket,
+    "close",
     () => {
+      if (generation !== websocketState.socketGeneration) return;
+
       websocketState.connected =
         false;
 
       websocketState.connecting =
         false;
 
-      scheduleReconnect(
-        symbols
-      );
-    };
+      if (
+        !websocketState.manualDisconnect
+      ) {
+        scheduleReconnect(
+          normalizedSymbols
+        );
+      }
+    }
+  );
 
   return {
     connected:
       websocketState.connected,
 
+    connecting:
+      websocketState.connecting,
+
     streams:
-      [...websocketState.streams]
+      [...websocketState.streams],
+
+    symbols:
+      [...websocketState.symbols]
   };
 }
+
 
 function handleWebSocketMessage(
   raw
 ) {
   try {
-    const parsed =
+    let parsed;
+
+    if (
       typeof raw === "string"
-        ? JSON.parse(raw)
-        : JSON.parse(
-            Buffer.from(raw)
-              .toString("utf8")
-          );
+    ) {
+      parsed =
+        JSON.parse(raw);
+    } else if (
+      raw instanceof ArrayBuffer
+    ) {
+      parsed =
+        JSON.parse(
+          new TextDecoder()
+            .decode(raw)
+        );
+    } else if (
+      typeof Buffer !== "undefined" &&
+      Buffer.isBuffer(raw)
+    ) {
+      parsed =
+        JSON.parse(
+          raw.toString("utf8")
+        );
+    } else if (
+      raw?.data
+    ) {
+      parsed =
+        JSON.parse(
+          String(raw.data)
+        );
+    } else {
+      return;
+    }
 
     const payload =
       parsed?.data ??
       parsed;
 
     if (
-      !payload
+      !payload ||
+      typeof payload !==
+        "object"
     ) {
       return;
     }
@@ -1805,7 +2856,8 @@ function handleWebSocketMessage(
       payload.ps;
 
     if (
-      !symbol
+      typeof symbol !==
+      "string"
     ) {
       return;
     }
@@ -1820,7 +2872,13 @@ function handleWebSocketMessage(
         normalized
       ) ?? {
         symbol:
-          normalized
+          normalized,
+
+        timestamp:
+          iso(),
+
+        timestampMs:
+          now()
       };
 
     existing.realtime =
@@ -1829,6 +2887,9 @@ function handleWebSocketMessage(
 
     existing.realtime.lastEventAt =
       now();
+
+    existing.realtime.lastEventAtISO =
+      iso();
 
     existing.realtime.lastEventType =
       eventType;
@@ -1853,6 +2914,9 @@ function handleWebSocketMessage(
             payload.T
           ),
 
+        timestampISO:
+          iso(payload.T),
+
         buyerMaker:
           Boolean(
             payload.m
@@ -1866,23 +2930,35 @@ function handleWebSocketMessage(
     ) {
       existing.realtime.depth = {
         firstUpdateId:
-          payload.U,
+          numberOrNull(
+            payload.U
+          ),
 
         finalUpdateId:
-          payload.u,
+          numberOrNull(
+            payload.u
+          ),
 
         bids:
-          Array.isArray(
-            payload.b
-          )
+          Array.isArray(payload.b)
             ? payload.b
+                .map(
+                  row => [
+                    positiveNumberOrNull(row[0]),
+                    positiveNumberOrNull(row[1])
+                  ]
+                )
             : [],
 
         asks:
-          Array.isArray(
-            payload.a
-          )
+          Array.isArray(payload.a)
             ? payload.a
+                .map(
+                  row => [
+                    positiveNumberOrNull(row[0]),
+                    positiveNumberOrNull(row[1])
+                  ]
+                )
             : []
       };
     }
@@ -1911,6 +2987,11 @@ function handleWebSocketMessage(
           nextFundingTime:
             numberOrNull(
               payload.T
+            ),
+
+          eventTime:
+            numberOrNull(
+              payload.E
             )
         };
     }
@@ -1939,6 +3020,11 @@ function handleWebSocketMessage(
           askQuantity:
             positiveNumberOrNull(
               payload.A
+            ),
+
+          eventTime:
+            numberOrNull(
+              payload.E
             )
         };
     }
@@ -1988,6 +3074,16 @@ function handleWebSocketMessage(
                 kline.x
               ),
 
+            startTime:
+              numberOrNull(
+                kline.t
+              ),
+
+            endTime:
+              numberOrNull(
+                kline.T
+              ),
+
             timestamp:
               numberOrNull(
                 kline.T
@@ -1995,6 +3091,12 @@ function handleWebSocketMessage(
           };
       }
     }
+
+    existing.timestamp =
+      iso();
+
+    existing.timestampMs =
+      now();
 
     memory.set(
       normalized,
@@ -2005,11 +3107,15 @@ function handleWebSocketMessage(
   }
 }
 
+
 function scheduleReconnect(
   symbols
 ) {
   if (
-    websocketState.reconnectTimer
+    websocketState.manualDisconnect ||
+    websocketState.reconnectTimer ||
+    !Array.isArray(symbols) ||
+    symbols.length === 0
   ) {
     return;
   }
@@ -2023,7 +3129,10 @@ function scheduleReconnect(
       1_000 *
         Math.pow(
           2,
-          attempt
+          Math.min(
+            attempt,
+            5
+          )
         )
     );
 
@@ -2045,7 +3154,8 @@ function scheduleReconnect(
           );
         } catch (error) {
           websocketState.lastError =
-            error.message;
+            error?.message ||
+            "WebSocket reconnect failed";
 
           scheduleReconnect(
             symbols
@@ -2056,12 +3166,57 @@ function scheduleReconnect(
     );
 }
 
-/* =========================================================
-   WEBSOCKET STATUS
-   ========================================================= */
+
+// ============================================================
+// WEBSOCKET CONTROL
+// ============================================================
+
+export function disconnectMarketStream() {
+  websocketState.socketGeneration += 1;
+
+  websocketState.manualDisconnect =
+    true;
+
+  if (
+    websocketState.reconnectTimer
+  ) {
+    clearTimeout(
+      websocketState.reconnectTimer
+    );
+
+    websocketState.reconnectTimer =
+      null;
+  }
+
+  if (
+    websocketState.socket
+  ) {
+    try {
+      websocketState.socket.close();
+    } catch {
+      // Ignore close errors.
+    }
+  }
+
+  websocketState.socket =
+    null;
+
+  websocketState.connected =
+    false;
+
+  websocketState.connecting =
+    false;
+
+  return true;
+}
+
+
+// ============================================================
+// WEBSOCKET STATUS
+// ============================================================
 
 export function getMarketStreamStatus() {
-  const ageSeconds =
+  const age =
     websocketState.lastMessageAt > 0
       ? (
           now() -
@@ -2076,8 +3231,21 @@ export function getMarketStreamStatus() {
     connecting:
       websocketState.connecting,
 
+    reconnectAttempts:
+      websocketState.reconnectAttempts,
+
     streams:
       [...websocketState.streams],
+
+    symbols:
+      [...websocketState.symbols],
+
+    lastConnectedAt:
+      websocketState.lastConnectedAt
+        ? iso(
+            websocketState.lastConnectedAt
+          )
+        : null,
 
     lastMessageAt:
       websocketState.lastMessageAt
@@ -2087,16 +3255,23 @@ export function getMarketStreamStatus() {
         : null,
 
     messageAgeSeconds:
-      ageSeconds,
+      age,
+
+    stale:
+      age !== null
+        ? age >
+          DEFAULT_FRESHNESS_SECONDS
+        : true,
 
     lastError:
       websocketState.lastError
   };
 }
 
-/* =========================================================
-   MODULE STATUS
-   ========================================================= */
+
+// ============================================================
+// MODULE STATUS
+// ============================================================
 
 export function getMarketDataStatus() {
   return {
@@ -2139,16 +3314,31 @@ export function getMarketDataStatus() {
     openInterest:
       true,
 
+    openInterestHistory:
+      true,
+
     longShortRatio:
       true,
 
+    takerVolume:
+      true,
+
     volatility:
+      true,
+
+    rangeMetrics:
       true,
 
     marketRegime:
       true,
 
     abnormalMarketDetection:
+      true,
+
+    freshnessTracking:
+      true,
+
+    partialFailureProtection:
       true,
 
     privateKeys:
@@ -2163,7 +3353,97 @@ export function getMarketDataStatus() {
     withdrawals:
       false,
 
+    retryPolicy:
+      {
+        maxRetries:
+          MAX_HTTP_RETRIES,
+
+        baseDelayMs:
+          RETRY_BASE_DELAY_MS
+      },
+
+    websocketLimits:
+      {
+        maxSymbols:
+          MAX_WS_SYMBOLS,
+
+        maxStreams:
+          MAX_WS_STREAMS
+      },
+
     status:
       "Advanced market-data engine ready."
   };
 }
+
+
+// ============================================================
+// ENGINE HEALTH
+// ============================================================
+
+export function getMarketDataHealth() {
+  const streamAge =
+    ageSeconds(websocketState.lastMessageAt);
+
+  const cachedSymbols =
+    [...memory.keys()];
+
+  return {
+    module: MODULE_NAME,
+    version: MODULE_VERSION,
+    timestamp: iso(),
+    cache: {
+      symbols: cachedSymbols,
+      size: cachedSymbols.length
+    },
+    websocket: {
+      connected: websocketState.connected,
+      connecting: websocketState.connecting,
+      stale:
+        streamAge !== null &&
+        streamAge > DEFAULT_FRESHNESS_SECONDS,
+      messageAgeSeconds: streamAge,
+      lastError: websocketState.lastError
+    },
+    inFlightMarketStates:
+      inFlightMarketStates.size,
+    security: {
+      trading: false,
+      walletAccess: false,
+      privateKeys: false,
+      withdrawals: false
+    }
+  };
+}
+
+
+// ============================================================
+// DEFAULT EXPORT
+// ============================================================
+
+export default {
+  getTicker,
+  getCandles,
+  getOrderBook,
+  calculateOrderBookMetrics,
+  getBookTicker,
+  getRecentTrades,
+  calculateTradeFlow,
+  getPremiumIndex,
+  getOpenInterest,
+  getLongShortRatio,
+  getOpenInterestHistory,
+  getTakerVolume,
+  calculateVolatility,
+  calculateRangeMetrics,
+  calculateMarketRegime,
+  detectAbnormalMarket,
+  getMarketState,
+  getCachedMarketState,
+  clearCachedMarketState,
+  connectMarketStream,
+  disconnectMarketStream,
+  getMarketStreamStatus,
+  getMarketDataStatus,
+  getMarketDataHealth
+};
