@@ -1,1291 +1,974 @@
 // Jev Connector
-// HTTP API Server V1.4.0
+// Server V2.0.0
 //
-// Purpose:
-// - Protected Jev evaluation API
-// - Read-only Shared Memory access
-// - Trader Engine integration
-// - Paper-trading API
-// - Strict validation
-// - Rate limiting
-// - Safe logging
-// - Consistent request IDs across the security layer and API
+// PURPOSE
+// - AI Hub gateway for Jev
+// - Market evaluation
+// - Trade-intent evaluation
+// - Shared memory
+// - Health and diagnostics
 //
-// SAFETY:
-// - PAPER trading only through this API
-// - Live trading is blocked
-// - No wallet access
-// - No private keys
-// - No withdrawals
-// - No exchange permission changes
+// IMPORTANT
+// - No runTrader dependency
+// - No trader-engine status dependency
+// - Paper trading by default
+// - Live trading requires explicit environment configuration
+// - Secrets are never returned
+//
 
 import express from "express";
 import cors from "cors";
+import crypto from "node:crypto";
 
-import {
-  attachRequestId,
-  requireJevAuth,
-  getAuthStatus
-} from "./security.js";
-
-import {
-  evaluateMarketState
-} from "./jev-engine.js";
-
-import {
-  getEngineStatus
-} from "./trader-engine.js";
+import { evaluateMarketState } from "./jev-engine.js";
+import { evaluateTrade } from "./trader-engine.js";
 
 import {
   getSharedMemory,
+  saveSharedMemory,
   searchSharedMemory,
   getRecentMemories,
   getSharedMemoryStats,
   buildJevMemoryContext,
   getJevMemorySnapshot,
   checkSharedMemoryConnection,
-  getSharedMemoryStatus
+  getSharedMemoryStatus,
 } from "./shared-memory.js";
 
-// ============================================================
-// CONFIGURATION
-// ============================================================
+
+// ==================================================
+// SERVER CONFIG
+// ==================================================
 
 const app = express();
 
 const PORT = Number(process.env.PORT || 3000);
 
-const SERVICE_NAME = "Jev Connector";
-const SERVICE_VERSION = "1.4.0";
+const SERVICE = "Jev Connector";
+const VERSION = "2.0.0";
 
-const JSON_LIMIT = "1mb";
 
-const MAX_MEMORY_QUERIES = 10;
-const MAX_MEMORY_QUERY_LENGTH = 500;
+// ==================================================
+// SECURITY CONFIG
+// ==================================================
 
-const MAX_EVALUATIONS_PER_MINUTE = 30;
-const MAX_TRADER_REQUESTS_PER_MINUTE = 20;
+const JEV_API_KEY = process.env.JEV_API_KEY || "";
+
+const MAX_BODY_SIZE = "1mb";
+
+
+// ==================================================
+// TRADING SAFETY
+// ==================================================
+
+const PAPER_TRADING =
+  String(process.env.PAPER_TRADING ?? "true").toLowerCase() === "true";
+
+const LIVE_TRADING =
+  String(process.env.LIVE_TRADING ?? "false").toLowerCase() === "true";
+
+
+// Live trading is considered enabled only when BOTH
+// flags explicitly allow it.
+
+const LIVE_ENABLED =
+  LIVE_TRADING === true &&
+  PAPER_TRADING === false;
+
+
+// ==================================================
+// RATE LIMIT
+// ==================================================
 
 const RATE_WINDOW_MS = 60 * 1000;
+const RATE_LIMIT = 120;
 
-// ============================================================
-// HARDENING
-// ============================================================
+const requestCounts = new Map();
 
-app.disable("x-powered-by");
-app.set("trust proxy", 1);
 
-// ============================================================
-// REQUEST ID
-// ============================================================
-//
-// security.js owns the canonical request ID.
-// Keeping one request ID prevents mismatched IDs in:
-// - security responses
-// - HTTP logs
-// - API responses
-//
-
-app.use(attachRequestId);
-
-// ============================================================
-// CORS
-// ============================================================
-
-const configuredOrigins = String(process.env.CORS_ORIGIN || "")
-  .split(",")
-  .map(value => value.trim())
-  .filter(Boolean);
-
-const corsOptions = {
-  origin(origin, callback) {
-    if (!origin) {
-      return callback(null, true);
-    }
-
-    if (configuredOrigins.length === 0) {
-      return callback(new Error("Browser CORS is not configured"));
-    }
-
-    if (configuredOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-
-    return callback(new Error("CORS origin not allowed"));
-  },
-
-  methods: ["GET", "POST", "OPTIONS"],
-
-  allowedHeaders: [
-    "Content-Type",
-    "Authorization",
-    "x-ai-client",
-    "x-request-id"
-  ],
-
-  maxAge: 600
-};
-
-app.use(cors(corsOptions));
-
-// ============================================================
-// JSON
-// ============================================================
+// ==================================================
+// EXPRESS
+// ==================================================
 
 app.use(
-  express.json({
-    limit: JSON_LIMIT,
-    strict: true
+  cors({
+    origin: true,
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-JEV-API-Key",
+    ],
   })
 );
 
-// ============================================================
-// SAFE LOGGING
-// ============================================================
+app.use(express.json({ limit: MAX_BODY_SIZE }));
+
+
+// ==================================================
+// REQUEST ID
+// ==================================================
 
 app.use((req, res, next) => {
-  const started = Date.now();
+  const requestId = crypto.randomUUID();
 
-  res.on("finish", () => {
-    const duration = Date.now() - started;
+  req.requestId = requestId;
 
-    const client =
-      req.jevAuth?.client ||
-      "unauthenticated";
-
-    console.log(
-      `[HTTP] ${req.method} ${req.path} ` +
-      `${res.statusCode} ${duration}ms ` +
-      `client=${client} ` +
-      `request=${req.requestId}`
-    );
-  });
+  res.setHeader("X-Request-ID", requestId);
 
   next();
 });
 
-// ============================================================
-// RATE LIMITING
-// ============================================================
 
-const evaluationRateMap = new Map();
-const traderRateMap = new Map();
+// ==================================================
+// RATE LIMITER
+// ==================================================
 
-function cleanupRateMap(map) {
+function rateLimit(req, res, next) {
   const now = Date.now();
 
-  for (const [key, entry] of map) {
-    if (
-      now - entry.startedAt >=
-      RATE_WINDOW_MS
-    ) {
-      map.delete(key);
-    }
-  }
-}
-
-setInterval(() => {
-  cleanupRateMap(evaluationRateMap);
-  cleanupRateMap(traderRateMap);
-}, RATE_WINDOW_MS).unref();
-
-function checkRateLimit(req, map, maximum) {
-  const client =
-    req.jevAuth?.client ||
-    "unknown";
+  const forwarded =
+    req.headers["x-forwarded-for"];
 
   const ip =
-    req.ip ||
-    "unknown";
+    typeof forwarded === "string"
+      ? forwarded.split(",")[0].trim()
+      : req.socket.remoteAddress || "unknown";
 
-  const key = `${client}:${ip}`;
+  let record = requestCounts.get(ip);
+
+  if (!record || now - record.start > RATE_WINDOW_MS) {
+    record = {
+      start: now,
+      count: 0,
+    };
+
+    requestCounts.set(ip, record);
+  }
+
+  record.count++;
+
+  if (record.count > RATE_LIMIT) {
+    return res.status(429).json({
+      ok: false,
+      error: "Rate limit exceeded",
+      requestId: req.requestId,
+    });
+  }
+
+  next();
+}
+
+app.use(rateLimit);
+
+
+// Periodically remove old rate-limit records.
+
+setInterval(() => {
   const now = Date.now();
 
-  let entry = map.get(key);
+  for (const [ip, record] of requestCounts.entries()) {
+    if (now - record.start > RATE_WINDOW_MS) {
+      requestCounts.delete(ip);
+    }
+  }
+}, RATE_WINDOW_MS).unref();
 
-  if (
-    !entry ||
-    now - entry.startedAt >= RATE_WINDOW_MS
-  ) {
-    entry = {
-      startedAt: now,
-      count: 0
-    };
 
-    map.set(key, entry);
+// ==================================================
+// AUTHENTICATION
+// ==================================================
+
+function safeCompare(a, b) {
+  if (!a || !b) {
+    return false;
   }
 
-  entry.count += 1;
+  const aBuffer = Buffer.from(String(a));
+  const bBuffer = Buffer.from(String(b));
 
-  if (entry.count > maximum) {
-    return {
-      allowed: false,
-      retryAfter: Math.ceil(
-        (
-          RATE_WINDOW_MS -
-          (now - entry.startedAt)
-        ) / 1000
-      )
-    };
+  if (aBuffer.length !== bBuffer.length) {
+    return false;
   }
 
+  return crypto.timingSafeEqual(
+    aBuffer,
+    bBuffer
+  );
+}
+
+
+function authenticate(req, res, next) {
+
+  // No configured key = development/open mode.
+  // Render can be secured simply by adding JEV_API_KEY.
+
+  if (!JEV_API_KEY) {
+    return next();
+  }
+
+  const authorization =
+    req.headers.authorization || "";
+
+  const bearerKey =
+    authorization.startsWith("Bearer ")
+      ? authorization.slice(7)
+      : "";
+
+  const headerKey =
+    req.headers["x-jev-api-key"] || "";
+
+  const suppliedKey =
+    bearerKey || headerKey;
+
+  if (!safeCompare(suppliedKey, JEV_API_KEY)) {
+    return res.status(401).json({
+      ok: false,
+      error: "Unauthorized",
+      requestId: req.requestId,
+    });
+  }
+
+  next();
+}
+
+
+// ==================================================
+// BASIC SERVICE INFO
+// ==================================================
+
+function getExecutionStatus() {
   return {
-    allowed: true,
-    retryAfter: 0
+    paper: PAPER_TRADING,
+    live: LIVE_ENABLED,
   };
 }
 
-// ============================================================
-// VALIDATION HELPERS
-// ============================================================
 
-function isPlainObject(value) {
-  return (
-    value !== null &&
-    typeof value === "object" &&
-    !Array.isArray(value)
-  );
-}
-
-function validateMemoryQueries(queries) {
-  if (!Array.isArray(queries)) {
-    return "queries must be an array";
-  }
-
-  if (queries.length > MAX_MEMORY_QUERIES) {
-    return (
-      `queries cannot contain more than ` +
-      `${MAX_MEMORY_QUERIES} items`
-    );
-  }
-
-  for (const query of queries) {
-    if (
-      typeof query !== "string" ||
-      query.trim().length === 0 ||
-      query.length > MAX_MEMORY_QUERY_LENGTH
-    ) {
-      return "Invalid memory query";
-    }
-  }
-
-  return null;
-}
-
-function parseMemoryLimit(value, fallback = 10) {
-  const parsed = Number(value);
-
-  if (!Number.isFinite(parsed)) {
-    return fallback;
-  }
-
-  return Math.min(
-    Math.max(Math.floor(parsed), 1),
-    10
-  );
-}
-
-// ============================================================
-// PUBLIC ROOT
-// ============================================================
+// ==================================================
+// ROOT
+// ==================================================
 
 app.get("/", (req, res) => {
-  res.setHeader("Cache-Control", "no-store");
-
   res.json({
     ok: true,
-    service: SERVICE_NAME,
-    version: SERVICE_VERSION,
+
+    service: SERVICE,
+
+    version: VERSION,
+
     status: "online",
 
     role: "evaluation-and-paper-trading",
 
-    execution: {
-      live: false,
-      paper: true
-    },
+    execution: getExecutionStatus(),
 
     walletAccess: false,
+
     privateKeys: false,
-    withdrawals: false
-  });
-});
 
-// ============================================================
-// PUBLIC HEALTH
-// ============================================================
-
-app.get("/health", async (req, res) => {
-  let memory;
-
-  try {
-    memory = await checkSharedMemoryConnection();
-  } catch {
-    memory = {
-      ok: false,
-      configured: false,
-      connected: false,
-      readOnly: true
-    };
-  }
-
-  const healthy =
-    memory.configured
-      ? memory.connected
-      : true;
-
-  res.setHeader("Cache-Control", "no-store");
-
-  res.status(healthy ? 200 : 503).json({
-    ok: healthy,
-
-    service: SERVICE_NAME,
-    version: SERVICE_VERSION,
-
-    status:
-      healthy
-        ? "online"
-        : "degraded",
-
-    execution: {
-      live: false,
-      paper: true
-    },
-
-    walletAccess: false,
-    privateKeys: false,
     withdrawals: false,
 
     authentication: {
-      configured:
-        getAuthStatus().configured
+      configured: Boolean(JEV_API_KEY),
     },
 
-    sharedMemory: {
-      configured:
-        memory.configured,
-
-      connected:
-        memory.connected,
-
-      readOnly: true
-    },
-
-    requestId:
-      req.requestId
+    requestId: req.requestId,
   });
 });
 
-// ============================================================
-// AUTHENTICATION
-// ============================================================
 
-app.use("/api", requireJevAuth);
+// ==================================================
+// HEALTH
+// ==================================================
 
-// ============================================================
-// API SECURITY HEADERS
-// ============================================================
-
-app.use("/api", (req, res, next) => {
-  res.setHeader("Cache-Control", "no-store");
-  res.setHeader("X-Content-Type-Options", "nosniff");
-  res.setHeader("X-Frame-Options", "DENY");
-  res.setHeader("Referrer-Policy", "no-referrer");
-  res.setHeader("X-DNS-Prefetch-Control", "off");
-
-  next();
-});
-
-// ============================================================
-// API ROOT
-// ============================================================
-
-app.get("/api", (req, res) => {
-  res.json({
+app.get("/health", (req, res) => {
+  res.status(200).json({
     ok: true,
 
-    service: SERVICE_NAME,
-    version: SERVICE_VERSION,
+    service: SERVICE,
 
-    authenticated: true,
+    version: VERSION,
 
-    role: "evaluation-and-paper-trading",
+    status: "online",
 
-    endpoints: {
-      status: "GET /api/status",
-      evaluate: "POST /api/evaluate",
+    uptime: Math.floor(process.uptime()),
 
-      traderStatus:
-        "GET /api/trader/status",
+    execution: getExecutionStatus(),
 
-      traderPaper:
-        "POST /api/trader/paper",
-
-      memory:
-        "GET /api/memory/:id",
-
-      memorySearch:
-        "GET /api/memory/search",
-
-      memoryRecent:
-        "GET /api/memory/recent",
-
-      memoryStats:
-        "GET /api/memory/stats",
-
-      memoryContext:
-        "POST /api/memory/context",
-
-      memorySnapshot:
-        "POST /api/memory/snapshot",
-
-      memoryHealth:
-        "GET /api/memory/health"
+    modules: {
+      jevEngine: true,
+      traderEngine: true,
+      sharedMemory: true,
     },
 
-    requestId:
-      req.requestId
+    requestId: req.requestId,
   });
 });
 
-// ============================================================
+
+// ==================================================
 // STATUS
-// ============================================================
+// ==================================================
 
-app.get("/api/status", (req, res) => {
-  let trader;
-
+app.get("/api/status", authenticate, async (req, res) => {
   try {
-    trader = getTraderStatus();
-  } catch (error) {
-    trader = {
-      available: false,
-      error:
-        error?.message ||
-        "Trader status unavailable"
-    };
-  }
 
-  res.json({
-    ok: true,
+    const memoryStatus =
+      await getSharedMemoryStatus();
 
-    service: SERVICE_NAME,
-    version: SERVICE_VERSION,
+    const memoryConnected =
+      Boolean(memoryStatus?.connected);
 
-    authenticated: true,
+    const memoryConfigured =
+      Boolean(memoryStatus?.configured);
 
-    role: "evaluation-and-paper-trading",
+    const status =
+      memoryConfigured && !memoryConnected
+        ? "degraded"
+        : "online";
 
-    execution: {
-      enabled: false,
-      live: false,
-      paper: true,
+    res.status(200).json({
+      ok: status === "online",
+
+      service: SERVICE,
+
+      version: VERSION,
+
+      status,
+
+      role: "evaluation-and-paper-trading",
+
+      execution: getExecutionStatus(),
 
       walletAccess: false,
+
       privateKeys: false,
+
       withdrawals: false,
 
-      exchangePermissionChanges: false
-    },
+      authentication: {
+        configured: Boolean(JEV_API_KEY),
+      },
 
-    authentication: {
-      configured:
-        getAuthStatus().configured
-    },
+      sharedMemory: memoryStatus,
 
-    trader,
+      modules: {
+        jevEngine: true,
+        traderEngine: true,
+        sharedMemory: true,
+      },
 
-    sharedMemory:
-      getSharedMemoryStatus(),
-
-    limits: {
-      maxEvaluationsPerMinute:
-        MAX_EVALUATIONS_PER_MINUTE,
-
-      maxTraderRequestsPerMinute:
-        MAX_TRADER_REQUESTS_PER_MINUTE,
-
-      maxMemoryQueries:
-        MAX_MEMORY_QUERIES,
-
-      maxMemoryQueryLength:
-        MAX_MEMORY_QUERY_LENGTH
-    },
-
-    requestId:
-      req.requestId
-  });
-});
-
-// ============================================================
-// TRADER STATUS
-// ============================================================
-
-app.get("/api/trader/status", (req, res) => {
-  try {
-    const trader = getTraderStatus();
-
-    return res.json({
-      ok: true,
       requestId: req.requestId,
-      trader
     });
-  } catch {
-    return res.status(500).json({
-      ok: false,
-      error: "Unable to read Trader status",
-      requestId: req.requestId
-    });
-  }
-});
 
-// ============================================================
-// PAPER TRADER
-// ============================================================
-//
-// PAPER ONLY.
-// No exchange order is submitted by this endpoint.
-// Live trading is explicitly refused.
-//
-
-app.post("/api/trader/paper", async (req, res) => {
-  const rate = checkRateLimit(
-    req,
-    traderRateMap,
-    MAX_TRADER_REQUESTS_PER_MINUTE
-  );
-
-  if (!rate.allowed) {
-    res.setHeader(
-      "Retry-After",
-      String(rate.retryAfter)
-    );
-
-    return res.status(429).json({
-      ok: false,
-      error: "Trader rate limit exceeded",
-      retryAfterSeconds: rate.retryAfter,
-      requestId: req.requestId
-    });
-  }
-
-  try {
-    const body = req.body;
-
-    if (!isPlainObject(body)) {
-      return res.status(400).json({
-        ok: false,
-        error: "Request body must be an object",
-        requestId: req.requestId
-      });
-    }
-
-    if (
-      body.state === undefined ||
-      body.state === null
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: "state is required",
-        requestId: req.requestId
-      });
-    }
-
-    if (
-      process.env.TRADING_MODE
-        ?.trim()
-        .toUpperCase() === "LIVE"
-    ) {
-      return res.status(403).json({
-        ok: false,
-        error:
-          "Paper endpoint is disabled while TRADING_MODE=LIVE",
-        requestId: req.requestId
-      });
-    }
-
-    const policy =
-      isPlainObject(body.policy)
-        ? body.policy
-        : {};
-
-    const result = await runTrader(
-      body.state,
-      { policy }
-    );
-
-    return res.json({
-      ok: true,
-      requestId: req.requestId,
-      mode: "PAPER",
-      liveTrading: false,
-      executionAllowed: false,
-      result
-    });
   } catch (error) {
+
     console.error(
-      `[TRADER] Paper request failed ` +
-      `request=${req.requestId}:`,
-      error?.message || "unknown error"
+      "[JEV] Status error:",
+      error.message
     );
 
-    return res.status(502).json({
-      ok: false,
-      error: "Paper trader evaluation failed",
-      requestId: req.requestId
-    });
-  }
-});
-
-// ============================================================
-// JEV EVALUATION
-// ============================================================
-
-app.post("/api/evaluate", async (req, res) => {
-  const rate = checkRateLimit(
-    req,
-    evaluationRateMap,
-    MAX_EVALUATIONS_PER_MINUTE
-  );
-
-  if (!rate.allowed) {
-    res.setHeader(
-      "Retry-After",
-      String(rate.retryAfter)
-    );
-
-    return res.status(429).json({
-      ok: false,
-      error: "Evaluation rate limit exceeded",
-      retryAfterSeconds: rate.retryAfter,
-      requestId: req.requestId
-    });
-  }
-
-  try {
-    const body = req.body;
-
-    if (!isPlainObject(body)) {
-      return res.status(400).json({
-        ok: false,
-        error: "Request body must be an object",
-        requestId: req.requestId
-      });
-    }
-
-    const state = body.state;
-
-    if (
-      state === undefined ||
-      state === null
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: "state is required",
-        requestId: req.requestId
-      });
-    }
-
-    let evaluationState = state;
-
-    if (body.memoryQueries !== undefined) {
-      const validationError =
-        validateMemoryQueries(
-          body.memoryQueries
-        );
-
-      if (validationError) {
-        return res.status(400).json({
-          ok: false,
-          error: validationError,
-          requestId: req.requestId
-        });
-      }
-
-      try {
-        const snapshot =
-          await getJevMemorySnapshot(
-            body.memoryQueries,
-            {
-              limit: 10,
-              status: "ACTIVE"
-            }
-          );
-
-        if (
-          isPlainObject(evaluationState)
-        ) {
-          evaluationState = {
-            ...evaluationState,
-
-            sharedMemory: snapshot,
-
-            sharedMemoryPolicy: {
-              role: "reference-data",
-              executable: false,
-              instructionsAllowed: false
-            }
-          };
-        } else {
-          evaluationState = {
-            marketState: evaluationState,
-
-            sharedMemory: snapshot,
-
-            sharedMemoryPolicy: {
-              role: "reference-data",
-              executable: false,
-              instructionsAllowed: false
-            }
-          };
-        }
-      } catch (error) {
-        console.error(
-          `[JEV] Shared Memory context failed ` +
-          `request=${req.requestId}:`,
-          error?.message || "unknown error"
-        );
-
-        return res.status(502).json({
-          ok: false,
-          error:
-            "Unable to retrieve requested Shared Memory context",
-          requestId: req.requestId
-        });
-      }
-    }
-
-    const result =
-      await evaluateMarketState(
-        evaluationState
-      );
-
-    return res.json({
+    res.status(200).json({
       ok: true,
-      requestId: req.requestId,
-      result
-    });
-  } catch (error) {
-    console.error(
-      `[JEV] Evaluation failed ` +
-      `request=${req.requestId}:`,
-      error?.message || "unknown error"
-    );
 
-    return res.status(502).json({
-      ok: false,
-      error: "Jev evaluation failed",
-      requestId: req.requestId
-    });
-  }
-});
+      service: SERVICE,
 
-// ============================================================
-// MEMORY: GET ONE
-// ============================================================
+      version: VERSION,
 
-app.get("/api/memory/:id", async (req, res) => {
-  try {
-    const id = req.params.id;
+      status: "online",
 
-    if (
-      typeof id !== "string" ||
-      id.length === 0 ||
-      id.length > 200
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: "Invalid memory id",
-        requestId: req.requestId
-      });
-    }
-
-    const memory =
-      await getSharedMemory(id);
-
-    if (!memory) {
-      return res.status(404).json({
-        ok: false,
-        error: "Memory not found",
-        requestId: req.requestId
-      });
-    }
-
-    return res.json({
-      ok: true,
-      requestId: req.requestId,
-      readOnly: true,
-      memory
-    });
-  } catch (error) {
-    console.error(
-      `[MEMORY] Read failed ` +
-      `request=${req.requestId}:`,
-      error?.message || "unknown error"
-    );
-
-    return res.status(502).json({
-      ok: false,
-      error: "Unable to read Shared Memory",
-      requestId: req.requestId
-    });
-  }
-});
-
-// ============================================================
-// MEMORY: SEARCH
-// ============================================================
-
-app.get("/api/memory/search", async (req, res) => {
-  try {
-    const query = req.query.q;
-
-    if (
-      typeof query !== "string" ||
-      !query.trim()
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: "q query parameter is required",
-        requestId: req.requestId
-      });
-    }
-
-    if (
-      query.length >
-      MAX_MEMORY_QUERY_LENGTH
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: "Search query is too long",
-        requestId: req.requestId
-      });
-    }
-
-    const results =
-      await searchSharedMemory(
-        query,
-        {
-          limit:
-            parseMemoryLimit(
-              req.query.limit
-            ),
-
-          category:
-            req.query.category,
-
-          source_ai:
-            req.query.source_ai,
-
-          related_project:
-            req.query.related_project,
-
-          status:
-            req.query.status
-        }
-      );
-
-    return res.json({
-      ok: true,
-      requestId: req.requestId,
-      readOnly: true,
-      count: results.length,
-      results
-    });
-  } catch (error) {
-    console.error(
-      `[MEMORY] Search failed ` +
-      `request=${req.requestId}:`,
-      error?.message || "unknown error"
-    );
-
-    return res.status(502).json({
-      ok: false,
-      error: "Shared Memory search failed",
-      requestId: req.requestId
-    });
-  }
-});
-
-// ============================================================
-// MEMORY: RECENT
-// ============================================================
-
-app.get("/api/memory/recent", async (req, res) => {
-  try {
-    const memories =
-      await getRecentMemories({
-        limit:
-          parseMemoryLimit(
-            req.query.limit
-          ),
-
-        includeArchived:
-          req.query.includeArchived === "true"
-      });
-
-    return res.json({
-      ok: true,
-      requestId: req.requestId,
-      readOnly: true,
-      count: memories.length,
-      memories
-    });
-  } catch (error) {
-    console.error(
-      `[MEMORY] Recent memory failed ` +
-      `request=${req.requestId}:`,
-      error?.message || "unknown error"
-    );
-
-    return res.status(502).json({
-      ok: false,
-      error:
-        "Unable to read recent Shared Memory",
-      requestId: req.requestId
-    });
-  }
-});
-
-// ============================================================
-// MEMORY: STATS
-// ============================================================
-
-app.get("/api/memory/stats", async (req, res) => {
-  try {
-    const stats =
-      await getSharedMemoryStats();
-
-    return res.json({
-      ok: true,
-      requestId: req.requestId,
-      readOnly: true,
-      stats
-    });
-  } catch (error) {
-    console.error(
-      `[MEMORY] Stats failed ` +
-      `request=${req.requestId}:`,
-      error?.message || "unknown error"
-    );
-
-    return res.status(502).json({
-      ok: false,
-      error:
-        "Unable to read Shared Memory statistics",
-      requestId: req.requestId
-    });
-  }
-});
-
-// ============================================================
-// MEMORY: CONTEXT
-// ============================================================
-
-app.post("/api/memory/context", async (req, res) => {
-  try {
-    const body = req.body;
-
-    if (!isPlainObject(body)) {
-      return res.status(400).json({
-        ok: false,
-        error: "Request body must be an object",
-        requestId: req.requestId
-      });
-    }
-
-    const validationError =
-      validateMemoryQueries(body.queries);
-
-    if (validationError) {
-      return res.status(400).json({
-        ok: false,
-        error: validationError,
-        requestId: req.requestId
-      });
-    }
-
-    const context =
-      await buildJevMemoryContext(
-        body.queries,
-        {
-          limit:
-            parseMemoryLimit(
-              body.limit
-            ),
-
-          category:
-            body.category,
-
-          source_ai:
-            body.source_ai,
-
-          related_project:
-            body.related_project,
-
-          status:
-            body.status ||
-            "ACTIVE"
-        }
-      );
-
-    return res.json({
-      ok: true,
-      requestId: req.requestId,
-      readOnly: true,
-      context
-    });
-  } catch (error) {
-    console.error(
-      `[MEMORY] Context failed ` +
-      `request=${req.requestId}:`,
-      error?.message || "unknown error"
-    );
-
-    return res.status(502).json({
-      ok: false,
-      error:
-        "Unable to build Jev memory context",
-      requestId: req.requestId
-    });
-  }
-});
-
-// ============================================================
-// MEMORY: SNAPSHOT
-// ============================================================
-
-app.post("/api/memory/snapshot", async (req, res) => {
-  try {
-    const body = req.body;
-
-    if (!isPlainObject(body)) {
-      return res.status(400).json({
-        ok: false,
-        error: "Request body must be an object",
-        requestId: req.requestId
-      });
-    }
-
-    const queries =
-      body.queries === undefined
-        ? []
-        : body.queries;
-
-    const validationError =
-      validateMemoryQueries(queries);
-
-    if (validationError) {
-      return res.status(400).json({
-        ok: false,
-        error: validationError,
-        requestId: req.requestId
-      });
-    }
-
-    const snapshot =
-      await getJevMemorySnapshot(
-        queries,
-        {
-          limit: 10,
-          status: "ACTIVE"
-        }
-      );
-
-    return res.json({
-      ok: true,
-      requestId: req.requestId,
-      readOnly: true,
-      snapshot
-    });
-  } catch (error) {
-    console.error(
-      `[MEMORY] Snapshot failed ` +
-      `request=${req.requestId}:`,
-      error?.message || "unknown error"
-    );
-
-    return res.status(502).json({
-      ok: false,
-      error:
-        "Unable to build memory snapshot",
-      requestId: req.requestId
-    });
-  }
-});
-
-// ============================================================
-// MEMORY: HEALTH
-// ============================================================
-
-app.get("/api/memory/health", async (req, res) => {
-  try {
-    const result =
-      await checkSharedMemoryConnection();
-
-    return res.status(
-      result.ok ? 200 : 503
-    ).json({
-      ok: result.ok,
-      requestId: req.requestId,
-      sharedMemory: result
-    });
-  } catch {
-    return res.status(503).json({
-      ok: false,
-      requestId: req.requestId,
+      execution: getExecutionStatus(),
 
       sharedMemory: {
-        ok: false,
         configured: false,
         connected: false,
-        readOnly: true
-      }
+      },
+
+      requestId: req.requestId,
     });
   }
 });
 
-// ============================================================
-// UNKNOWN API ROUTES
-// ============================================================
 
-app.use("/api", (req, res) => {
+// ==================================================
+// MARKET EVALUATION
+// ==================================================
+
+app.post(
+  "/api/evaluate-market",
+  authenticate,
+  async (req, res) => {
+
+    try {
+
+      const marketData =
+        req.body?.marketData ?? req.body;
+
+      if (
+        !marketData ||
+        typeof marketData !== "object"
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error: "Invalid market data",
+          requestId: req.requestId,
+        });
+      }
+
+      const result =
+        await evaluateMarketState(
+          marketData
+        );
+
+      return res.json({
+        ok: true,
+
+        service: SERVICE,
+
+        operation: "market-evaluation",
+
+        result,
+
+        requestId: req.requestId,
+      });
+
+    } catch (error) {
+
+      console.error(
+        "[JEV] Market evaluation error:",
+        error.message
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error: "Market evaluation failed",
+        requestId: req.requestId,
+      });
+    }
+  }
+);
+
+
+// ==================================================
+// TRADE EVALUATION
+// ==================================================
+//
+// IMPORTANT:
+// This creates a TRADE INTENT.
+// It does not execute a trade.
+//
+
+app.post(
+  "/api/evaluate-trade",
+  authenticate,
+  async (req, res) => {
+
+    try {
+
+      const state =
+        req.body?.state ?? req.body;
+
+      const options =
+        req.body?.options ?? {};
+
+      if (
+        !state ||
+        typeof state !== "object"
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error: "Invalid trader state",
+          requestId: req.requestId,
+        });
+      }
+
+      const result =
+        await evaluateTrade(
+          state,
+          options
+        );
+
+      return res.json({
+        ok: true,
+
+        service: SERVICE,
+
+        operation: "trade-evaluation",
+
+        execution: {
+          paper: PAPER_TRADING,
+          live: LIVE_ENABLED,
+        },
+
+        result,
+
+        requestId: req.requestId,
+      });
+
+    } catch (error) {
+
+      console.error(
+        "[JEV] Trade evaluation error:",
+        error.message
+      );
+
+      return res.status(500).json({
+        ok: false,
+        error: "Trade evaluation failed",
+        requestId: req.requestId,
+      });
+    }
+  }
+);
+
+
+// ==================================================
+// SHARED MEMORY STATUS
+// ==================================================
+
+app.get(
+  "/api/memory/status",
+  authenticate,
+  async (req, res) => {
+
+    try {
+
+      const result =
+        await getSharedMemoryStatus();
+
+      res.json({
+        ok: true,
+
+        sharedMemory: result,
+
+        requestId: req.requestId,
+      });
+
+    } catch (error) {
+
+      console.error(
+        "[JEV] Memory status error:",
+        error.message
+      );
+
+      res.status(500).json({
+        ok: false,
+        error: "Shared memory status failed",
+        requestId: req.requestId,
+      });
+    }
+  }
+);
+
+
+// ==================================================
+// SHARED MEMORY CONNECTION CHECK
+// ==================================================
+
+app.get(
+  "/api/memory/connection",
+  authenticate,
+  async (req, res) => {
+
+    try {
+
+      const result =
+        await checkSharedMemoryConnection();
+
+      res.json({
+        ok: true,
+
+        connection: result,
+
+        requestId: req.requestId,
+      });
+
+    } catch (error) {
+
+      console.error(
+        "[JEV] Memory connection error:",
+        error.message
+      );
+
+      res.status(500).json({
+        ok: false,
+        error: "Shared memory connection check failed",
+        requestId: req.requestId,
+      });
+    }
+  }
+);
+
+
+// ==================================================
+// SHARED MEMORY STATS
+// ==================================================
+
+app.get(
+  "/api/memory/stats",
+  authenticate,
+  async (req, res) => {
+
+    try {
+
+      const result =
+        await getSharedMemoryStats();
+
+      res.json({
+        ok: true,
+
+        stats: result,
+
+        requestId: req.requestId,
+      });
+
+    } catch (error) {
+
+      console.error(
+        "[JEV] Memory stats error:",
+        error.message
+      );
+
+      res.status(500).json({
+        ok: false,
+        error: "Shared memory statistics failed",
+        requestId: req.requestId,
+      });
+    }
+  }
+);
+
+
+// ==================================================
+// RECENT MEMORIES
+// ==================================================
+
+app.get(
+  "/api/memory/recent",
+  authenticate,
+  async (req, res) => {
+
+    try {
+
+      let limit =
+        Number(req.query.limit || 20);
+
+      if (!Number.isFinite(limit)) {
+        limit = 20;
+      }
+
+      limit =
+        Math.max(
+          1,
+          Math.min(
+            Math.floor(limit),
+            100
+          )
+        );
+
+      const result =
+        await getRecentMemories(limit);
+
+      res.json({
+        ok: true,
+
+        memories: result,
+
+        limit,
+
+        requestId: req.requestId,
+      });
+
+    } catch (error) {
+
+      console.error(
+        "[JEV] Recent memory error:",
+        error.message
+      );
+
+      res.status(500).json({
+        ok: false,
+        error: "Could not retrieve recent memories",
+        requestId: req.requestId,
+      });
+    }
+  }
+);
+
+
+// ==================================================
+// MEMORY SEARCH
+// ==================================================
+
+app.post(
+  "/api/memory/search",
+  authenticate,
+  async (req, res) => {
+
+    try {
+
+      const query =
+        typeof req.body?.query === "string"
+          ? req.body.query.trim()
+          : "";
+
+      if (!query) {
+        return res.status(400).json({
+          ok: false,
+          error: "Search query is required",
+          requestId: req.requestId,
+        });
+      }
+
+      const result =
+        await searchSharedMemory(query);
+
+      res.json({
+        ok: true,
+
+        query,
+
+        results: result,
+
+        requestId: req.requestId,
+      });
+
+    } catch (error) {
+
+      console.error(
+        "[JEV] Memory search error:",
+        error.message
+      );
+
+      res.status(500).json({
+        ok: false,
+        error: "Memory search failed",
+        requestId: req.requestId,
+      });
+    }
+  }
+);
+
+
+// ==================================================
+// SAVE MEMORY
+// ==================================================
+
+app.post(
+  "/api/memory",
+  authenticate,
+  async (req, res) => {
+
+    try {
+
+      if (
+        !req.body ||
+        typeof req.body !== "object"
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error: "Memory payload is required",
+          requestId: req.requestId,
+        });
+      }
+
+      const result =
+        await saveSharedMemory(
+          req.body
+        );
+
+      res.json({
+        ok: true,
+
+        memory: result,
+
+        requestId: req.requestId,
+      });
+
+    } catch (error) {
+
+      console.error(
+        "[JEV] Save memory error:",
+        error.message
+      );
+
+      res.status(500).json({
+        ok: false,
+        error: "Could not save memory",
+        requestId: req.requestId,
+      });
+    }
+  }
+);
+
+
+// ==================================================
+// JEV MEMORY CONTEXT
+// ==================================================
+
+app.post(
+  "/api/memory/context",
+  authenticate,
+  async (req, res) => {
+
+    try {
+
+      const input =
+        req.body?.input ??
+        req.body?.query ??
+        "";
+
+      const result =
+        await buildJevMemoryContext(
+          input
+        );
+
+      res.json({
+        ok: true,
+
+        context: result,
+
+        requestId: req.requestId,
+      });
+
+    } catch (error) {
+
+      console.error(
+        "[JEV] Memory context error:",
+        error.message
+      );
+
+      res.status(500).json({
+        ok: false,
+        error: "Could not build Jev memory context",
+        requestId: req.requestId,
+      });
+    }
+  }
+);
+
+
+// ==================================================
+// JEV MEMORY SNAPSHOT
+// ==================================================
+
+app.get(
+  "/api/memory/snapshot",
+  authenticate,
+  async (req, res) => {
+
+    try {
+
+      const result =
+        await getJevMemorySnapshot();
+
+      res.json({
+        ok: true,
+
+        snapshot: result,
+
+        requestId: req.requestId,
+      });
+
+    } catch (error) {
+
+      console.error(
+        "[JEV] Memory snapshot error:",
+        error.message
+      );
+
+      res.status(500).json({
+        ok: false,
+        error: "Memory snapshot failed",
+        requestId: req.requestId,
+      });
+    }
+  }
+);
+
+
+// ==================================================
+// 404
+// ==================================================
+
+app.use((req, res) => {
+
   res.status(404).json({
     ok: false,
-    error: "API endpoint not found",
-    requestId: req.requestId
+
+    error: "Route not found",
+
+    path: req.path,
+
+    requestId: req.requestId,
   });
+
 });
 
-// ============================================================
-// REQUEST ERROR HANDLER
-// ============================================================
 
-app.use((error, req, res, next) => {
-  if (
-    error?.type === "entity.too.large"
-  ) {
-    return res.status(413).json({
-      ok: false,
-      error: "Request body is too large",
-      requestId: req.requestId
-    });
-  }
-
-  if (
-    error instanceof SyntaxError &&
-    error.status === 400 &&
-    "body" in error
-  ) {
-    return res.status(400).json({
-      ok: false,
-      error: "Invalid JSON",
-      requestId: req.requestId
-    });
-  }
-
-  return next(error);
-});
-
-// ============================================================
+// ==================================================
 // GLOBAL ERROR HANDLER
-// ============================================================
+// ==================================================
 
 app.use((error, req, res, next) => {
+
   console.error(
-    `[SERVER] Unhandled error ` +
-    `request=${req.requestId}:`,
-    error?.message || "unknown error"
+    "[JEV] Unhandled server error:",
+    error.message
   );
 
   if (res.headersSent) {
     return next(error);
   }
 
-  return res.status(500).json({
+  res.status(500).json({
     ok: false,
+
     error: "Internal server error",
-    requestId: req.requestId
+
+    requestId: req.requestId,
   });
+
 });
 
-// ============================================================
-// START SERVER
-// ============================================================
 
-const server = app.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
-    console.log(
-      `${SERVICE_NAME} ${SERVICE_VERSION} ` +
-      `listening on port ${PORT}`
-    );
-
-    console.log(
-      `[SECURITY] Authentication configured: ` +
-      `${getAuthStatus().configured}`
-    );
-
-    console.log(
-      "[SECURITY] Jev evaluation: true"
-    );
-
-    console.log(
-      "[SECURITY] Paper trading: true"
-    );
-
-    console.log(
-      "[SECURITY] Live trading: false"
-    );
-
-    console.log(
-      "[SECURITY] Wallet access: false"
-    );
-
-    console.log(
-      "[SECURITY] Withdrawal access: false"
-    );
-
-    console.log(
-      "[SECURITY] Private-key access: false"
-    );
-  }
-);
-
-// ============================================================
+// ==================================================
 // GRACEFUL SHUTDOWN
-// ============================================================
+// ==================================================
 
-let shuttingDown = false;
+let server;
 
 function shutdown(signal) {
-  if (shuttingDown) {
-    return;
-  }
-
-  shuttingDown = true;
 
   console.log(
-    `[SERVER] ${signal} received.`
+    `[JEV] ${signal} received. Shutting down...`
   );
 
+  if (!server) {
+    process.exit(0);
+  }
+
   server.close(() => {
+
     console.log(
-      "[SERVER] Shutdown complete."
+      "[JEV] Server stopped."
     );
 
     process.exit(0);
   });
 
   setTimeout(() => {
+
     console.error(
-      "[SERVER] Forced shutdown."
+      "[JEV] Forced shutdown."
     );
 
     process.exit(1);
+
   }, 10000).unref();
 }
+
 
 process.on(
   "SIGTERM",
@@ -1295,4 +978,49 @@ process.on(
 process.on(
   "SIGINT",
   () => shutdown("SIGINT")
+);
+
+
+// ==================================================
+// START
+// ==================================================
+
+server = app.listen(
+  PORT,
+  "0.0.0.0",
+  () => {
+
+    console.log(
+      "========================================"
+    );
+
+    console.log(
+      `${SERVICE} started`
+    );
+
+    console.log(
+      `Version: ${VERSION}`
+    );
+
+    console.log(
+      `Port: ${PORT}`
+    );
+
+    console.log(
+      `Paper trading: ${PAPER_TRADING}`
+    );
+
+    console.log(
+      `Live trading: ${LIVE_ENABLED}`
+    );
+
+    console.log(
+      `Authentication: ${Boolean(JEV_API_KEY)}`
+    );
+
+    console.log(
+      "========================================"
+    );
+
+  }
 );
