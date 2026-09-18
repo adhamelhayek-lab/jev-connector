@@ -1,20 +1,11 @@
 // Jev Trader Engine
-// V3.0.0
+// V3.1.0
 //
 // Jev is the Trader decision engine.
 //
 // FLOW:
-// Market Data
-//     ↓
-// Jev Evaluation
-//     ↓
-// Hard Safety / Risk Policy
-//     ↓
-// Position Reconciliation
-//     ↓
-// Trade Intent
-//     ↓
-// Paper or Live Execution
+// Market Data -> Jev Evaluation -> Hard Safety / Risk Policy
+// -> Accumulation Rules -> Trade Intent -> Paper/Live Execution
 //
 // SAFETY:
 // - Paper trading by default
@@ -22,38 +13,28 @@
 // - Emergency kill switch
 // - Daily loss lockout
 // - Consecutive-loss protection
-// - Maximum exposure
-// - Maximum leverage
-// - Maximum slippage
-// - Maximum accumulation
+// - Maximum exposure / leverage / slippage
+// - Daily accumulation control
+// - Monthly accumulation exit
 // - Duplicate-trade protection
 // - Decision cooldown
 // - Market-data freshness
-// - Position reconciliation
 // - Audit information
 //
-// This module does not contain exchange credentials
-// or private keys.
+// This module contains no exchange credentials or private keys.
 
 import crypto from "node:crypto";
 import { evaluateMarketState } from "./jev-engine.js";
 
 const ENGINE_NAME = "Jev Trader Engine";
-const ENGINE_VERSION = "3.0.0";
+const ENGINE_VERSION = "3.1.0";
 
 const VALID_DECISIONS = new Set([
-  "LONG",
-  "SHORT",
-  "HOLD",
-  "REDUCE",
-  "EXIT",
-  "WAIT"
+  "LONG", "SHORT", "HOLD", "REDUCE", "EXIT", "WAIT"
 ]);
 
 const VALID_POSITION_SIDES = new Set([
-  "FLAT",
-  "LONG",
-  "SHORT"
+  "FLAT", "LONG", "SHORT"
 ]);
 
 const DEFAULT_POLICY = Object.freeze({
@@ -68,25 +49,23 @@ const DEFAULT_POLICY = Object.freeze({
   minimumRiskCompatibility: 0.5,
 
   staleDataSeconds: 30,
-
   decisionCooldownSeconds: 30,
-
   maxConsecutiveLosses: 3,
 
+  // Legacy overall accumulation ceiling.
   maxAccumulationEntries: 3,
 
-  requireMarketTimestamp: true,
+  // New: additions to an existing accumulation position
+  // are limited per UTC calendar day.
+  maxDailyAccumulationEntries: 1,
 
+  // New: when an accumulation position belongs to a
+  // previous UTC month, the engine forces EXIT.
+  monthlyAccumulationExit: true,
+
+  requireMarketTimestamp: true,
   allowOppositePosition: false
 });
-
-/*
- * Runtime safety state.
- *
- * This is intentionally in memory for V3.
- * A production version should persist critical state
- * so a restart cannot accidentally reset safety controls.
- */
 
 const runtime = {
   lastDecisionAt: 0,
@@ -94,10 +73,10 @@ const runtime = {
   lastTradeFingerprint: null,
 
   consecutiveLosses: 0,
-
   dailyLossLocked: false,
 
   accumulationEntries: 0,
+  accumulationDate: null,
 
   killSwitch: false
 };
@@ -108,106 +87,75 @@ function createTradeId() {
 
 function numberOrNull(value) {
   const number = Number(value);
-
-  return Number.isFinite(number)
-    ? number
-    : null;
+  return Number.isFinite(number) ? number : null;
 }
 
 function positiveNumberOrNull(value) {
   const number = numberOrNull(value);
-
-  if (number === null || number < 0) {
-    return null;
-  }
-
-  return number;
+  return number === null || number < 0 ? null : number;
 }
 
 function normalizePolicy(input = {}) {
   const source =
-    input &&
-    typeof input === "object"
-      ? input
-      : {};
+    input && typeof input === "object" ? input : {};
 
-  const merged = {
-    ...DEFAULT_POLICY,
-    ...source
-  };
+  const merged = { ...DEFAULT_POLICY, ...source };
 
   return {
     maxPositionNotional:
-      positiveNumberOrNull(
-        merged.maxPositionNotional
-      ) ??
-      DEFAULT_POLICY.maxPositionNotional,
+      positiveNumberOrNull(merged.maxPositionNotional)
+      ?? DEFAULT_POLICY.maxPositionNotional,
 
     maxExposure:
-      positiveNumberOrNull(
-        merged.maxExposure
-      ) ??
-      DEFAULT_POLICY.maxExposure,
+      positiveNumberOrNull(merged.maxExposure)
+      ?? DEFAULT_POLICY.maxExposure,
 
     maxDailyLoss:
-      positiveNumberOrNull(
-        merged.maxDailyLoss
-      ) ??
-      DEFAULT_POLICY.maxDailyLoss,
+      positiveNumberOrNull(merged.maxDailyLoss)
+      ?? DEFAULT_POLICY.maxDailyLoss,
 
     maxLeverage:
-      positiveNumberOrNull(
-        merged.maxLeverage
-      ) ??
-      DEFAULT_POLICY.maxLeverage,
+      positiveNumberOrNull(merged.maxLeverage)
+      ?? DEFAULT_POLICY.maxLeverage,
 
     maxSlippageBps:
-      positiveNumberOrNull(
-        merged.maxSlippageBps
-      ) ??
-      DEFAULT_POLICY.maxSlippageBps,
+      positiveNumberOrNull(merged.maxSlippageBps)
+      ?? DEFAULT_POLICY.maxSlippageBps,
 
     minimumSetupQuality:
-      positiveNumberOrNull(
-        merged.minimumSetupQuality
-      ) ??
-      DEFAULT_POLICY.minimumSetupQuality,
+      positiveNumberOrNull(merged.minimumSetupQuality)
+      ?? DEFAULT_POLICY.minimumSetupQuality,
 
     minimumEvidenceProbability:
-      positiveNumberOrNull(
-        merged.minimumEvidenceProbability
-      ) ??
-      DEFAULT_POLICY.minimumEvidenceProbability,
+      positiveNumberOrNull(merged.minimumEvidenceProbability)
+      ?? DEFAULT_POLICY.minimumEvidenceProbability,
 
     minimumRiskCompatibility:
-      positiveNumberOrNull(
-        merged.minimumRiskCompatibility
-      ) ??
-      DEFAULT_POLICY.minimumRiskCompatibility,
+      positiveNumberOrNull(merged.minimumRiskCompatibility)
+      ?? DEFAULT_POLICY.minimumRiskCompatibility,
 
     staleDataSeconds:
-      positiveNumberOrNull(
-        merged.staleDataSeconds
-      ) ??
-      DEFAULT_POLICY.staleDataSeconds,
+      positiveNumberOrNull(merged.staleDataSeconds)
+      ?? DEFAULT_POLICY.staleDataSeconds,
 
     decisionCooldownSeconds:
-      positiveNumberOrNull(
-        merged.decisionCooldownSeconds
-      ) ??
-      DEFAULT_POLICY.decisionCooldownSeconds,
+      positiveNumberOrNull(merged.decisionCooldownSeconds)
+      ?? DEFAULT_POLICY.decisionCooldownSeconds,
 
     maxConsecutiveLosses:
-      positiveNumberOrNull(
-        merged.maxConsecutiveLosses
-      ) ??
-      DEFAULT_POLICY.maxConsecutiveLosses,
+      positiveNumberOrNull(merged.maxConsecutiveLosses)
+      ?? DEFAULT_POLICY.maxConsecutiveLosses,
 
     maxAccumulationEntries:
-      positiveNumberOrNull(
-        merged.maxAccumulationEntries
-      ) ??
-      DEFAULT_POLICY.maxAccumulationEntries,
+      positiveNumberOrNull(merged.maxAccumulationEntries)
+      ?? DEFAULT_POLICY.maxAccumulationEntries,
+
+    maxDailyAccumulationEntries:
+      positiveNumberOrNull(merged.maxDailyAccumulationEntries)
+      ?? DEFAULT_POLICY.maxDailyAccumulationEntries,
+
+    monthlyAccumulationExit:
+      merged.monthlyAccumulationExit !== false,
 
     requireMarketTimestamp:
       merged.requireMarketTimestamp !== false,
@@ -220,40 +168,27 @@ function normalizePolicy(input = {}) {
 function getTradingMode() {
   const value =
     typeof process.env.TRADING_MODE === "string"
-      ? process.env.TRADING_MODE
-          .trim()
-          .toUpperCase()
+      ? process.env.TRADING_MODE.trim().toUpperCase()
       : "PAPER";
 
-  return value === "LIVE"
-    ? "LIVE"
-    : "PAPER";
+  return value === "LIVE" ? "LIVE" : "PAPER";
 }
 
 function isLiveTradingEnabled() {
-  return (
-    process.env.LIVE_TRADING_ENABLED
-      ?.trim()
-      .toLowerCase() === "true"
-  );
+  return process.env.LIVE_TRADING_ENABLED
+    ?.trim()
+    .toLowerCase() === "true";
 }
 
 function isKillSwitchEnabled() {
-  return (
-    process.env.TRADING_KILL_SWITCH
-      ?.trim()
-      .toLowerCase() === "true"
-  );
+  return process.env.TRADING_KILL_SWITCH
+    ?.trim()
+    .toLowerCase() === "true";
 }
 
 function validateState(state) {
-  if (
-    state === null ||
-    state === undefined
-  ) {
-    throw new Error(
-      "Market state is required."
-    );
+  if (state === null || state === undefined) {
+    throw new Error("Market state is required.");
   }
 
   if (
@@ -276,7 +211,8 @@ function normalizePosition(state) {
     entryPrice: null,
     markPrice: null,
     leverage: 1,
-    unrealizedPnl: 0
+    unrealizedPnl: 0,
+    accumulation: null
   };
 
   if (
@@ -287,8 +223,7 @@ function normalizePosition(state) {
     return empty;
   }
 
-  const source =
-    state.position;
+  const source = state.position;
 
   if (
     !source ||
@@ -300,9 +235,7 @@ function normalizePosition(state) {
 
   const rawSide =
     typeof source.side === "string"
-      ? source.side
-          .trim()
-          .toUpperCase()
+      ? source.side.trim().toUpperCase()
       : "FLAT";
 
   const side =
@@ -314,45 +247,35 @@ function normalizePosition(state) {
     positiveNumberOrNull(source.size) ?? 0;
 
   const markPrice =
-    positiveNumberOrNull(
-      source.markPrice
-    );
+    positiveNumberOrNull(source.markPrice);
 
   const suppliedNotional =
-    positiveNumberOrNull(
-      source.notional
-    );
+    positiveNumberOrNull(source.notional);
 
   const calculatedNotional =
-    markPrice !== null
-      ? size * markPrice
-      : 0;
+    markPrice !== null ? size * markPrice : 0;
 
   return {
     side,
-
     size,
-
-    notional:
-      suppliedNotional ??
-      calculatedNotional,
+    notional: suppliedNotional ?? calculatedNotional,
 
     entryPrice:
-      positiveNumberOrNull(
-        source.entryPrice
-      ),
+      positiveNumberOrNull(source.entryPrice),
 
     markPrice,
 
     leverage:
-      positiveNumberOrNull(
-        source.leverage
-      ) ?? 1,
+      positiveNumberOrNull(source.leverage) ?? 1,
 
     unrealizedPnl:
-      numberOrNull(
-        source.unrealizedPnl
-      ) ?? 0
+      numberOrNull(source.unrealizedPnl) ?? 0,
+
+    accumulation:
+      source.accumulation &&
+      typeof source.accumulation === "object"
+        ? source.accumulation
+        : null
   };
 }
 
@@ -372,12 +295,8 @@ function getRequestedNotional(state) {
   ];
 
   for (const value of values) {
-    const number =
-      positiveNumberOrNull(value);
-
-    if (number !== null) {
-      return number;
-    }
+    const number = positiveNumberOrNull(value);
+    if (number !== null) return number;
   }
 
   return null;
@@ -397,12 +316,9 @@ function getDailyLoss(state) {
     state.risk?.dailyLoss ??
     state.account?.dailyLoss;
 
-  const number =
-    numberOrNull(value);
+  const number = numberOrNull(value);
 
-  return number === null
-    ? 0
-    : Math.abs(number);
+  return number === null ? 0 : Math.abs(number);
 }
 
 function getExposure(state, position) {
@@ -418,9 +334,7 @@ function getExposure(state, position) {
         state.account?.exposure
       );
 
-    if (explicit !== null) {
-      return explicit;
-    }
+    if (explicit !== null) return explicit;
   }
 
   return position.notional;
@@ -459,121 +373,79 @@ function getMarketTimestamp(state) {
   );
 }
 
-function checkFreshness(
-  state,
-  policy
-) {
-  const rawTimestamp =
-    getMarketTimestamp(state);
+function checkFreshness(state, policy) {
+  const rawTimestamp = getMarketTimestamp(state);
 
   if (!rawTimestamp) {
     return {
-      passed:
-        !policy.requireMarketTimestamp,
-
+      passed: !policy.requireMarketTimestamp,
       ageSeconds: null,
-
-      reason:
-        policy.requireMarketTimestamp
-          ? "Market timestamp is missing."
-          : null
+      reason: policy.requireMarketTimestamp
+        ? "Market timestamp is missing."
+        : null
     };
   }
 
-  const timestamp =
-    new Date(rawTimestamp).getTime();
+  const timestamp = new Date(rawTimestamp).getTime();
 
   if (!Number.isFinite(timestamp)) {
     return {
       passed: false,
       ageSeconds: null,
-      reason:
-        "Market timestamp is invalid."
+      reason: "Market timestamp is invalid."
     };
   }
 
-  const ageSeconds =
-    Math.max(
-      0,
-      (Date.now() - timestamp) / 1000
-    );
+  const ageSeconds = Math.max(
+    0,
+    (Date.now() - timestamp) / 1000
+  );
 
   return {
-    passed:
-      ageSeconds <=
-      policy.staleDataSeconds,
-
+    passed: ageSeconds <= policy.staleDataSeconds,
     ageSeconds,
-
     reason:
-      ageSeconds >
-      policy.staleDataSeconds
+      ageSeconds > policy.staleDataSeconds
         ? "Market data is stale."
         : null
   };
 }
 
-function checkRisk(
-  state,
-  position,
-  policy
-) {
+function checkRisk(state, position, policy) {
   const violations = [];
 
-  const requestedNotional =
-    getRequestedNotional(state);
+  const requestedNotional = getRequestedNotional(state);
+  const exposure = getExposure(state, position);
+  const dailyLoss = getDailyLoss(state);
 
-  const exposure =
-    getExposure(
-      state,
-      position
-    );
+  const leverage = Math.abs(
+    numberOrNull(position.leverage) ?? 1
+  );
 
-  const dailyLoss =
-    getDailyLoss(state);
-
-  const leverage =
-    Math.abs(
-      numberOrNull(
-        position.leverage
-      ) ?? 1
-    );
-
-  const slippage =
-    getSlippageBps(state);
+  const slippage = getSlippageBps(state);
 
   if (
     requestedNotional !== null &&
-    requestedNotional >
-      policy.maxPositionNotional
+    requestedNotional > policy.maxPositionNotional
   ) {
     violations.push(
       "Requested notional exceeds the maximum position size."
     );
   }
 
-  if (
-    exposure >
-    policy.maxExposure
-  ) {
+  if (exposure > policy.maxExposure) {
     violations.push(
       "Account exposure exceeds the maximum allowed exposure."
     );
   }
 
-  if (
-    dailyLoss >=
-    policy.maxDailyLoss
-  ) {
+  if (dailyLoss >= policy.maxDailyLoss) {
     violations.push(
       "Daily loss limit has been reached."
     );
   }
 
-  if (
-    leverage >
-    policy.maxLeverage
-  ) {
+  if (leverage > policy.maxLeverage) {
     violations.push(
       "Leverage exceeds the maximum allowed leverage."
     );
@@ -581,17 +453,14 @@ function checkRisk(
 
   if (
     slippage !== null &&
-    slippage >
-      policy.maxSlippageBps
+    slippage > policy.maxSlippageBps
   ) {
     violations.push(
       "Estimated slippage exceeds the maximum allowed slippage."
     );
   }
 
-  if (
-    runtime.dailyLossLocked
-  ) {
+  if (runtime.dailyLossLocked) {
     violations.push(
       "Daily loss safety lock is active."
     );
@@ -607,41 +476,28 @@ function checkRisk(
   }
 
   return {
-    passed:
-      violations.length === 0,
-
+    passed: violations.length === 0,
     violations,
-
     metrics: {
       requestedNotional,
       exposure,
       dailyLoss,
       leverage,
       slippageBps: slippage,
-      consecutiveLosses:
-        runtime.consecutiveLosses
+      consecutiveLosses: runtime.consecutiveLosses
     }
   };
 }
 
 function getSetupQuality(evaluation) {
   return numberOrNull(
-    evaluation
-      ?.decision
-      ?.scores
-      ?.setupQuality
+    evaluation?.decision?.scores?.setupQuality
   );
 }
 
-function getProbability(
-  evaluation,
-  key
-) {
+function getProbability(evaluation, key) {
   return numberOrNull(
-    evaluation
-      ?.decision
-      ?.probabilities
-      ?.[key]
+    evaluation?.decision?.probabilities?.[key]
   );
 }
 
@@ -651,43 +507,27 @@ function determineDecision(
   policy
 ) {
   const raw =
-    evaluation
-      ?.decision
-      ?.direction
-      ?.choice;
+    evaluation?.decision?.direction?.choice;
 
   const decision =
-    VALID_DECISIONS.has(raw)
-      ? raw
-      : "WAIT";
+    VALID_DECISIONS.has(raw) ? raw : "WAIT";
 
   const evidence =
-    getProbability(
-      evaluation,
-      "sufficientEvidence"
-    );
+    getProbability(evaluation, "sufficientEvidence");
 
   const risk =
-    getProbability(
-      evaluation,
-      "riskCompatible"
-    );
+    getProbability(evaluation, "riskCompatible");
 
   const invalidated =
-    getProbability(
-      evaluation,
-      "thesisInvalidated"
-    );
+    getProbability(evaluation, "thesisInvalidated");
 
-  const setup =
-    getSetupQuality(evaluation);
+  const setup = getSetupQuality(evaluation);
 
   const reasons = [];
 
   if (
     evidence !== null &&
-    evidence <
-      policy.minimumEvidenceProbability
+    evidence < policy.minimumEvidenceProbability
   ) {
     reasons.push(
       "Evidence sufficiency is below threshold."
@@ -696,8 +536,7 @@ function determineDecision(
 
   if (
     risk !== null &&
-    risk <
-      policy.minimumRiskCompatibility
+    risk < policy.minimumRiskCompatibility
   ) {
     reasons.push(
       "Risk compatibility is below threshold."
@@ -709,8 +548,7 @@ function determineDecision(
     decision !== "HOLD" &&
     decision !== "REDUCE" &&
     decision !== "EXIT" &&
-    setup <
-      policy.minimumSetupQuality
+    setup < policy.minimumSetupQuality
   ) {
     reasons.push(
       "Setup quality is below threshold."
@@ -728,9 +566,7 @@ function determineDecision(
     );
   }
 
-  if (
-    reasons.length > 0
-  ) {
+  if (reasons.length > 0) {
     return {
       decision: "WAIT",
       overridden: true,
@@ -790,6 +626,175 @@ function determineDecision(
   };
 }
 
+function utcDateKey(date = new Date()) {
+  return date.toISOString().slice(0, 10);
+}
+
+function utcMonthKey(date = new Date()) {
+  return date.toISOString().slice(0, 7);
+}
+
+function getAccumulationState(state, position) {
+  const source =
+    state &&
+    typeof state === "object" &&
+    !Array.isArray(state)
+      ? state
+      : {};
+
+  const positionAccumulation =
+    position.accumulation &&
+    typeof position.accumulation === "object"
+      ? position.accumulation
+      : null;
+
+  const rootAccumulation =
+    source.accumulation &&
+    typeof source.accumulation === "object"
+      ? source.accumulation
+      : null;
+
+  const accumulation =
+    positionAccumulation ??
+    rootAccumulation ??
+    {};
+
+  const enabled =
+    accumulation.enabled === true ||
+    accumulation.isAccumulation === true ||
+    source.accumulationEnabled === true;
+
+  const monthKey =
+    typeof accumulation.monthKey === "string"
+      ? accumulation.monthKey.slice(0, 7)
+      : null;
+
+  const lastAccumulationDate =
+    typeof accumulation.lastAccumulationDate === "string"
+      ? accumulation.lastAccumulationDate.slice(0, 10)
+      : null;
+
+  const entriesToday =
+    positiveNumberOrNull(
+      accumulation.entriesToday
+    ) ?? 0;
+
+  return {
+    enabled,
+    monthKey,
+    lastAccumulationDate,
+    entriesToday
+  };
+}
+
+function getEffectiveDailyAccumulationEntries(accumulation) {
+  const today = utcDateKey();
+
+  if (runtime.accumulationDate !== today) {
+    runtime.accumulationDate = today;
+    runtime.accumulationEntries = 0;
+  }
+
+  const stateEntries =
+    accumulation.lastAccumulationDate === today
+      ? accumulation.entriesToday
+      : 0;
+
+  return Math.max(
+    runtime.accumulationEntries,
+    stateEntries
+  );
+}
+
+function checkAccumulationRules(
+  state,
+  position,
+  policy,
+  proposedDecision
+) {
+  const accumulation =
+    getAccumulationState(state, position);
+
+  const currentDate = utcDateKey();
+  const currentMonth = utcMonthKey();
+
+  const dailyEntries =
+    getEffectiveDailyAccumulationEntries(
+      accumulation
+    );
+
+  const monthlyExitRequired =
+    policy.monthlyAccumulationExit &&
+    accumulation.enabled &&
+    position.side !== "FLAT" &&
+    accumulation.monthKey !== null &&
+    accumulation.monthKey !== currentMonth;
+
+  const sameSideAdd =
+    accumulation.enabled &&
+    position.side !== "FLAT" &&
+    (
+      proposedDecision === position.side
+    );
+
+  const dailyAddLimitReached =
+    sameSideAdd &&
+    dailyEntries >=
+      policy.maxDailyAccumulationEntries;
+
+  return {
+    enabled: accumulation.enabled,
+    currentDate,
+    currentMonth,
+    positionMonth: accumulation.monthKey,
+    lastAccumulationDate:
+      accumulation.lastAccumulationDate,
+    dailyEntries,
+    maxDailyEntries:
+      policy.maxDailyAccumulationEntries,
+    monthlyExitRequired,
+    dailyAddLimitReached
+  };
+}
+
+function applyAccumulationRules(
+  selected,
+  accumulation,
+  position
+) {
+  if (accumulation.monthlyExitRequired) {
+    // Monthly exit is a hard lifecycle rule. It overrides
+    // a normal HOLD/LONG/SHORT decision.
+    if (position.side !== "FLAT") {
+      return {
+        decision: "EXIT",
+        overridden: true,
+        reasons: [
+          "Monthly accumulation exit is required because the accumulation month has ended."
+        ]
+      };
+    }
+  }
+
+  if (
+    accumulation.dailyAddLimitReached &&
+    (
+      selected.decision === "LONG" ||
+      selected.decision === "SHORT"
+    )
+  ) {
+    return {
+      decision: "WAIT",
+      overridden: true,
+      reasons: [
+        "Daily accumulation limit has been reached for the UTC calendar day."
+      ]
+    };
+  }
+
+  return selected;
+}
+
 function buildIntent(
   decision,
   state,
@@ -821,14 +826,11 @@ function buildIntent(
       notional: 0,
       reduceOnly: false,
       price,
-      reason:
-        `Jev selected ${decision}.`
+      reason: `Jev selected ${decision}.`
     };
   }
 
-  if (
-    decision === "EXIT"
-  ) {
+  if (decision === "EXIT") {
     if (
       position.side === "FLAT" ||
       position.size <= 0
@@ -839,8 +841,7 @@ function buildIntent(
         notional: 0,
         reduceOnly: true,
         price,
-        reason:
-          "No open position exists."
+        reason: "No open position exists."
       };
     }
 
@@ -850,14 +851,11 @@ function buildIntent(
       notional: position.notional,
       reduceOnly: true,
       price,
-      reason:
-        "Jev selected EXIT."
+      reason: "EXIT required by Trader lifecycle rules."
     };
   }
 
-  if (
-    decision === "REDUCE"
-  ) {
+  if (decision === "REDUCE") {
     if (
       position.side === "FLAT" ||
       position.size <= 0
@@ -868,20 +866,17 @@ function buildIntent(
         notional: 0,
         reduceOnly: true,
         price,
-        reason:
-          "No open position exists to reduce."
+        reason: "No open position exists to reduce."
       };
     }
 
     return {
       action: "REDUCE",
       side: position.side,
-      notional:
-        position.notional * 0.5,
+      notional: position.notional * 0.5,
       reduceOnly: true,
       price,
-      reason:
-        "Jev selected REDUCE."
+      reason: "Jev selected REDUCE."
     };
   }
 
@@ -899,8 +894,7 @@ function buildIntent(
         notional: 0,
         reduceOnly: false,
         price,
-        reason:
-          "Valid trade size is missing."
+        reason: "Valid trade size is missing."
       };
     }
 
@@ -925,8 +919,7 @@ function buildIntent(
       notional: requestedNotional,
       reduceOnly: false,
       price,
-      reason:
-        `Jev selected ${decision}.`
+      reason: `Jev selected ${decision}.`
     };
   }
 
@@ -936,64 +929,47 @@ function buildIntent(
     notional: 0,
     reduceOnly: false,
     price,
-    reason:
-      "No executable intent."
+    reason: "No executable intent."
   };
 }
 
 function fingerprintState(state) {
   try {
-    const serialized =
-      JSON.stringify(state);
-
     return crypto
       .createHash("sha256")
-      .update(serialized)
+      .update(JSON.stringify(state))
       .digest("hex");
   } catch {
     return null;
   }
 }
 
-function checkDuplicate(
-  fingerprint
-) {
-  if (
-    !fingerprint
-  ) {
-    return {
-      duplicate: false
-    };
+function checkDuplicate(fingerprint) {
+  if (!fingerprint) {
+    return { duplicate: false };
   }
 
   return {
     duplicate:
-      runtime.lastDecisionFingerprint ===
-      fingerprint
+      runtime.lastDecisionFingerprint === fingerprint
   };
 }
 
 function checkCooldown(policy) {
   const elapsed =
-    (Date.now() -
-      runtime.lastDecisionAt) /
-    1000;
+    (Date.now() - runtime.lastDecisionAt) / 1000;
 
   return {
     active:
       runtime.lastDecisionAt > 0 &&
-      elapsed <
-        policy.decisionCooldownSeconds,
+      elapsed < policy.decisionCooldownSeconds,
 
-    elapsedSeconds:
-      elapsed
+    elapsedSeconds: elapsed
   };
 }
 
 function applyGlobalSafety() {
-  if (
-    runtime.killSwitch
-  ) {
+  if (runtime.killSwitch) {
     return {
       blocked: true,
       reason:
@@ -1001,9 +977,7 @@ function applyGlobalSafety() {
     };
   }
 
-  if (
-    isKillSwitchEnabled()
-  ) {
+  if (isKillSwitchEnabled()) {
     return {
       blocked: true,
       reason:
@@ -1027,25 +1001,15 @@ function applyHardSafety(
 ) {
   const blockers = [];
 
-  if (
-    !risk.passed
-  ) {
-    blockers.push(
-      ...risk.violations
-    );
+  if (!risk.passed) {
+    blockers.push(...risk.violations);
   }
 
-  if (
-    !freshness.passed
-  ) {
-    blockers.push(
-      freshness.reason
-    );
+  if (!freshness.passed) {
+    blockers.push(freshness.reason);
   }
 
-  if (
-    duplicate
-  ) {
+  if (duplicate) {
     blockers.push(
       "Duplicate market state detected."
     );
@@ -1060,95 +1024,61 @@ function applyHardSafety(
     );
   }
 
-  if (
-    globalSafety.blocked
-  ) {
-    blockers.push(
-      globalSafety.reason
-    );
-  }
-
-  if (
-    blockers.length === 0
-  ) {
-    return {
-      allowed: true,
-      blockers: []
-    };
+  if (globalSafety.blocked) {
+    blockers.push(globalSafety.reason);
   }
 
   return {
-    allowed: false,
+    allowed: blockers.length === 0,
     blockers
   };
 }
 
-/**
- * Evaluate a complete Trader cycle.
- */
 export async function evaluateTrade(
   state,
   options = {}
 ) {
-  const normalizedState =
-    validateState(state);
-
-  const policy =
-    normalizePolicy(
-      options.policy
-    );
-
-  const position =
-    normalizePosition(
-      normalizedState
-    );
+  const normalizedState = validateState(state);
+  const policy = normalizePolicy(options.policy);
+  const position = normalizePosition(normalizedState);
 
   const fingerprint =
-    fingerprintState(
-      normalizedState
-    );
+    fingerprintState(normalizedState);
 
   const duplicateResult =
-    checkDuplicate(
-      fingerprint
-    );
+    checkDuplicate(fingerprint);
 
-  const cooldown =
-    checkCooldown(
-      policy
-    );
-
-  const globalSafety =
-    applyGlobalSafety();
-
+  const cooldown = checkCooldown(policy);
+  const globalSafety = applyGlobalSafety();
   const freshness =
-    checkFreshness(
-      normalizedState,
-      policy
-    );
+    checkFreshness(normalizedState, policy);
 
-  /*
-   * We still allow Jev to evaluate the state
-   * during a safety block so the audit record
-   * can explain what Jev saw.
-   */
   const evaluation =
-    await evaluateMarketState(
-      normalizedState
-    );
+    await evaluateMarketState(normalizedState);
 
   const risk =
-    checkRisk(
-      normalizedState,
-      position,
-      policy
-    );
+    checkRisk(normalizedState, position, policy);
 
-  const selected =
+  const selectedBase =
     determineDecision(
       evaluation,
       position,
       policy
+    );
+
+  const accumulation =
+    checkAccumulationRules(
+      normalizedState,
+      position,
+      policy,
+      selectedBase.decision
+    );
+
+  const selected =
+    applyAccumulationRules(
+      selectedBase,
+      accumulation,
+      position
     );
 
   const intent =
@@ -1178,122 +1108,88 @@ export async function evaluateTrade(
           notional: 0,
           reduceOnly: false,
           price: intent.price,
-          reason:
-            safety.blockers.join(" ")
+          reason: safety.blockers.join(" ")
         };
 
-  /*
-   * Record decision timing only after
-   * evaluation has completed.
-   */
-  runtime.lastDecisionAt =
-    Date.now();
+  runtime.lastDecisionAt = Date.now();
+  runtime.lastDecisionFingerprint = fingerprint;
 
-  runtime.lastDecisionFingerprint =
-    fingerprint;
+  if (finalIntent.action === "OPEN_OR_ADD") {
+    runtime.lastTradeFingerprint = fingerprint;
 
-  if (
-    finalIntent.action ===
-      "OPEN_OR_ADD"
-  ) {
-    runtime.lastTradeFingerprint =
-      fingerprint;
+    // Count only additions to an already-open position.
+    // A fresh FLAT -> LONG/SHORT entry is not an accumulation.
+    if (
+      position.side !== "FLAT" &&
+      finalIntent.side === position.side &&
+      accumulation.enabled
+    ) {
+      runtime.accumulationEntries =
+        accumulation.dailyEntries + 1;
+
+      runtime.accumulationDate =
+        accumulation.currentDate;
+    }
   }
 
   return {
-    tradeId:
-      createTradeId(),
+    tradeId: createTradeId(),
 
     engine: {
-      name:
-        ENGINE_NAME,
-
-      version:
-        ENGINE_VERSION
+      name: ENGINE_NAME,
+      version: ENGINE_VERSION
     },
 
-    timestamp:
-      new Date().toISOString(),
-
-    mode:
-      getTradingMode(),
+    timestamp: new Date().toISOString(),
+    mode: getTradingMode(),
 
     position,
 
     jev: {
-      decision:
-        selected.decision,
+      decision: selected.decision,
 
       rawDecision:
-        evaluation
-          ?.decision
-          ?.direction
-          ?.choice ??
+        evaluation?.decision?.direction?.choice ??
         "WAIT",
 
-      overridden:
-        selected.overridden,
-
-      overrideReasons:
-        selected.reasons,
+      overridden: selected.overridden,
+      overrideReasons: selected.reasons,
 
       confidence:
-        evaluation?.confidence ??
-        null,
+        evaluation?.confidence ?? null,
 
       probabilities:
-        evaluation
-          ?.decision
-          ?.probabilities ??
-        {},
+        evaluation?.decision?.probabilities ?? {},
 
       scores:
-        evaluation
-          ?.decision
-          ?.scores ??
-        {},
+        evaluation?.decision?.scores ?? {},
 
       consistency:
-        evaluation?.consistency ??
-        null
+        evaluation?.consistency ?? null
     },
 
     marketData: {
       freshness
     },
 
+    accumulation,
+
     risk: {
-      passed:
-        risk.passed,
-
-      violations:
-        risk.violations,
-
-      metrics:
-        risk.metrics,
-
+      passed: risk.passed,
+      violations: risk.violations,
+      metrics: risk.metrics,
       policy
     },
 
     safety: {
-      allowed:
-        safety.allowed,
-
-      blockers:
-        safety.blockers,
-
-      duplicate:
-        duplicateResult.duplicate,
-
-      cooldownActive:
-        cooldown.active,
-
-      killSwitch:
-        globalSafety.blocked
+      allowed: safety.allowed,
+      blockers: safety.blockers,
+      duplicate: duplicateResult.duplicate,
+      cooldownActive: cooldown.active,
+      killSwitch: globalSafety.blocked
     },
 
-    executionIntent:
-      finalIntent,
+    executionIntent: finalIntent,
 
     execution: {
       liveTradingEnabled:
@@ -1302,23 +1198,14 @@ export async function evaluateTrade(
       adapterConnected:
         Boolean(
           options.executionAdapter &&
-          typeof
-            options.executionAdapter.execute ===
-            "function"
+          typeof options.executionAdapter.execute === "function"
         ),
 
-      executed:
-        false
+      executed: false
     }
   };
 }
 
-/**
- * Execute the prepared intent.
- *
- * The actual exchange adapter is intentionally
- * separated from this engine.
- */
 export async function executeTrade(
   tradeResult,
   executionAdapter = null
@@ -1327,90 +1214,62 @@ export async function executeTrade(
     !tradeResult ||
     typeof tradeResult !== "object"
   ) {
-    throw new Error(
-      "Trade result is required."
-    );
+    throw new Error("Trade result is required.");
   }
 
-  const intent =
-    tradeResult.executionIntent;
+  const intent = tradeResult.executionIntent;
 
-  if (
-    !intent ||
-    typeof intent !== "object"
-  ) {
-    throw new Error(
-      "Execution intent is missing."
-    );
+  if (!intent || typeof intent !== "object") {
+    throw new Error("Execution intent is missing.");
   }
 
-  if (
-    intent.action === "NONE"
-  ) {
+  if (intent.action === "NONE") {
     return {
       executed: false,
       mode: "NO_ACTION",
-      tradeId:
-        tradeResult.tradeId,
+      tradeId: tradeResult.tradeId,
       intent,
-      reason:
-        intent.reason
+      reason: intent.reason
     };
   }
 
-  if (
-    !tradeResult.safety?.allowed
-  ) {
+  if (!tradeResult.safety?.allowed) {
     return {
       executed: false,
       mode: "BLOCKED",
-      tradeId:
-        tradeResult.tradeId,
+      tradeId: tradeResult.tradeId,
       intent,
       reason:
-        tradeResult
-          .safety
-          .blockers
-          .join(" ")
+        tradeResult.safety.blockers.join(" ")
     };
   }
 
-  if (
-    !tradeResult.risk?.passed
-  ) {
+  if (!tradeResult.risk?.passed) {
     return {
       executed: false,
       mode: "BLOCKED",
-      tradeId:
-        tradeResult.tradeId,
+      tradeId: tradeResult.tradeId,
       intent,
       reason:
         "Hard risk policy blocked execution."
     };
   }
 
-  if (
-    getTradingMode() !== "LIVE"
-  ) {
+  if (getTradingMode() !== "LIVE") {
     return {
       executed: false,
       mode: "PAPER",
-      tradeId:
-        tradeResult.tradeId,
+      tradeId: tradeResult.tradeId,
       intent,
-      reason:
-        "Paper trading mode is active."
+      reason: "Paper trading mode is active."
     };
   }
 
-  if (
-    !isLiveTradingEnabled()
-  ) {
+  if (!isLiveTradingEnabled()) {
     return {
       executed: false,
       mode: "BLOCKED",
-      tradeId:
-        tradeResult.tradeId,
+      tradeId: tradeResult.tradeId,
       intent,
       reason:
         "LIVE_TRADING_ENABLED is not enabled."
@@ -1424,8 +1283,7 @@ export async function executeTrade(
     return {
       executed: false,
       mode: "BLOCKED",
-      tradeId:
-        tradeResult.tradeId,
+      tradeId: tradeResult.tradeId,
       intent,
       reason:
         "Emergency kill switch is active."
@@ -1434,15 +1292,12 @@ export async function executeTrade(
 
   if (
     !executionAdapter ||
-    typeof
-      executionAdapter.execute !==
-        "function"
+    typeof executionAdapter.execute !== "function"
   ) {
     return {
       executed: false,
       mode: "BLOCKED",
-      tradeId:
-        tradeResult.tradeId,
+      tradeId: tradeResult.tradeId,
       intent,
       reason:
         "No execution adapter is connected."
@@ -1452,40 +1307,29 @@ export async function executeTrade(
   const result =
     await executionAdapter.execute(
       intent,
-      {
-        tradeId:
-          tradeResult.tradeId
-      }
+      { tradeId: tradeResult.tradeId }
     );
 
   return {
     executed: true,
     mode: "LIVE",
-    tradeId:
-      tradeResult.tradeId,
+    tradeId: tradeResult.tradeId,
     intent,
     result
   };
 }
 
-/**
- * Full Trader cycle.
- */
 export async function runTrader(
   state,
   options = {}
 ) {
   const trade =
-    await evaluateTrade(
-      state,
-      options
-    );
+    await evaluateTrade(state, options);
 
   const execution =
     await executeTrade(
       trade,
-      options.executionAdapter ??
-        null
+      options.executionAdapter ?? null
     );
 
   return {
@@ -1494,9 +1338,6 @@ export async function runTrader(
   };
 }
 
-/**
- * Record a completed losing trade.
- */
 export function recordLoss() {
   runtime.consecutiveLosses += 1;
 
@@ -1506,9 +1347,6 @@ export function recordLoss() {
   };
 }
 
-/**
- * Record a completed winning trade.
- */
 export function recordWin() {
   runtime.consecutiveLosses = 0;
 
@@ -1518,9 +1356,6 @@ export function recordWin() {
   };
 }
 
-/**
- * Activate the emergency kill switch.
- */
 export function activateKillSwitch() {
   runtime.killSwitch = true;
 
@@ -1529,24 +1364,14 @@ export function activateKillSwitch() {
   };
 }
 
-/**
- * Deactivate the runtime kill switch.
- *
- * This does not override the environment-level
- * TRADING_KILL_SWITCH.
- */
 export function deactivateKillSwitch() {
   runtime.killSwitch = false;
 
   return {
-    killSwitch:
-      runtime.killSwitch
+    killSwitch: runtime.killSwitch
   };
 }
 
-/**
- * Lock new trading for the current risk period.
- */
 export function activateDailyLossLock() {
   runtime.dailyLossLocked = true;
 
@@ -1555,19 +1380,17 @@ export function activateDailyLossLock() {
   };
 }
 
-/**
- * Reset controlled runtime state.
- *
- * This should only be called by an explicit
- * administrative operation in a future version.
- */
 export function resetRuntimeState() {
   runtime.lastDecisionAt = 0;
   runtime.lastDecisionFingerprint = null;
   runtime.lastTradeFingerprint = null;
+
   runtime.consecutiveLosses = 0;
   runtime.dailyLossLocked = false;
+
   runtime.accumulationEntries = 0;
+  runtime.accumulationDate = null;
+
   runtime.killSwitch = false;
 
   return getTraderStatus();
@@ -1575,15 +1398,10 @@ export function resetRuntimeState() {
 
 export function getTraderStatus() {
   return {
-    engine:
-      ENGINE_NAME,
+    engine: ENGINE_NAME,
+    version: ENGINE_VERSION,
 
-    version:
-      ENGINE_VERSION,
-
-    mode:
-      getTradingMode(),
-
+    mode: getTradingMode(),
     liveTradingEnabled:
       isLiveTradingEnabled(),
 
@@ -1602,19 +1420,26 @@ export function getTraderStatus() {
     accumulationEntries:
       runtime.accumulationEntries,
 
-    executionAdapter:
-      "required",
+    accumulationDate:
+      runtime.accumulationDate,
 
-    walletAccess:
-      false,
+    policy: {
+      maxDailyAccumulationEntries:
+        DEFAULT_POLICY.maxDailyAccumulationEntries,
 
-    privateKeys:
-      false,
+      maxAccumulationEntries:
+        DEFAULT_POLICY.maxAccumulationEntries,
 
-    withdrawals:
-      false,
+      monthlyAccumulationExit:
+        DEFAULT_POLICY.monthlyAccumulationExit
+    },
 
-    status:
-      "Trader engine ready."
+    executionAdapter: "required",
+
+    walletAccess: false,
+    privateKeys: false,
+    withdrawals: false,
+
+    status: "Trader engine ready."
   };
 }
