@@ -1,5 +1,5 @@
 // Jev Trader Engine
-// V3.1.0
+// V3.2.0
 //
 // Jev is the Trader decision engine.
 //
@@ -15,7 +15,8 @@
 // - Consecutive-loss protection
 // - Maximum exposure / leverage / slippage
 // - Daily accumulation control
-// - Monthly accumulation exit
+// - Explicit DCA controls and sizing
+// - BTC long-term accumulation with manual exit only
 // - Duplicate-trade protection
 // - Decision cooldown
 // - Market-data freshness
@@ -27,7 +28,7 @@ import crypto from "node:crypto";
 import { evaluateMarketState } from "./jev-engine.js";
 
 const ENGINE_NAME = "Jev Trader Engine";
-const ENGINE_VERSION = "3.1.0";
+const ENGINE_VERSION = "3.2.0";
 
 const VALID_DECISIONS = new Set([
   "LONG", "SHORT", "HOLD", "REDUCE", "EXIT", "WAIT"
@@ -55,13 +56,27 @@ const DEFAULT_POLICY = Object.freeze({
   // Legacy overall accumulation ceiling.
   maxAccumulationEntries: 3,
 
-  // New: additions to an existing accumulation position
-  // are limited per UTC calendar day.
+  // Additions to an existing accumulation position are
+  // limited per UTC calendar day.
   maxDailyAccumulationEntries: 1,
 
-  // New: when an accumulation position belongs to a
-  // previous UTC month, the engine forces EXIT.
-  monthlyAccumulationExit: true,
+  // Explicit DCA controls.
+  // DCA is restricted to BTCUSDT long-term accumulation.
+  // A fresh FLAT entry is never DCA.
+  dcaEnabled: true,
+  dcaSymbol: "BTCUSDT",
+  dcaLongOnly: true,
+  dcaNotionalFraction: 0.25,
+  maxDcaNotional: 25,
+  minDcaDistanceBps: 100,
+
+  // BTC accumulation is long-term and must be exited manually.
+  // Jev must never auto-EXIT or auto-REDUCE this accumulation.
+  manualAccumulationExit: true,
+
+  // Legacy monthly-exit switch is retained for compatibility,
+  // but disabled by default because BTC accumulation is manual-exit.
+  monthlyAccumulationExit: false,
 
   requireMarketTimestamp: true,
   allowOppositePosition: false
@@ -77,6 +92,7 @@ const runtime = {
 
   accumulationEntries: 0,
   accumulationDate: null,
+  accumulationTotalEntries: 0,
 
   killSwitch: false
 };
@@ -154,8 +170,35 @@ function normalizePolicy(input = {}) {
       positiveNumberOrNull(merged.maxDailyAccumulationEntries)
       ?? DEFAULT_POLICY.maxDailyAccumulationEntries,
 
+    dcaEnabled:
+      merged.dcaEnabled !== false,
+
+    dcaSymbol:
+      typeof merged.dcaSymbol === "string" &&
+      merged.dcaSymbol.trim()
+        ? merged.dcaSymbol.trim().toUpperCase()
+        : DEFAULT_POLICY.dcaSymbol,
+
+    dcaLongOnly:
+      merged.dcaLongOnly !== false,
+
+    dcaNotionalFraction:
+      positiveNumberOrNull(merged.dcaNotionalFraction)
+      ?? DEFAULT_POLICY.dcaNotionalFraction,
+
+    maxDcaNotional:
+      positiveNumberOrNull(merged.maxDcaNotional)
+      ?? DEFAULT_POLICY.maxDcaNotional,
+
+    minDcaDistanceBps:
+      positiveNumberOrNull(merged.minDcaDistanceBps)
+      ?? DEFAULT_POLICY.minDcaDistanceBps,
+
+    manualAccumulationExit:
+      merged.manualAccumulationExit !== false,
+
     monthlyAccumulationExit:
-      merged.monthlyAccumulationExit !== false,
+      merged.monthlyAccumulationExit === true,
 
     requireMarketTimestamp:
       merged.requireMarketTimestamp !== false,
@@ -411,11 +454,23 @@ function checkFreshness(state, policy) {
   };
 }
 
-function checkRisk(state, position, policy) {
+function checkRisk(
+  state,
+  position,
+  policy,
+  proposedNotional = null
+) {
   const violations = [];
 
-  const requestedNotional = getRequestedNotional(state);
-  const exposure = getExposure(state, position);
+  const requestedNotional =
+    proposedNotional ?? getRequestedNotional(state);
+
+  const baseExposure = getExposure(state, position);
+  const exposure =
+    proposedNotional !== null &&
+    position.side !== "FLAT"
+      ? baseExposure + proposedNotional
+      : baseExposure;
   const dailyLoss = getDailyLoss(state);
 
   const leverage = Math.abs(
@@ -679,11 +734,23 @@ function getAccumulationState(state, position) {
       accumulation.entriesToday
     ) ?? 0;
 
+  const entriesTotal =
+    positiveNumberOrNull(
+      accumulation.entriesTotal
+    ) ?? 0;
+
+  const lastAccumulationPrice =
+    positiveNumberOrNull(
+      accumulation.lastAccumulationPrice
+    );
+
   return {
     enabled,
     monthKey,
     lastAccumulationDate,
-    entriesToday
+    entriesToday,
+    entriesTotal,
+    lastAccumulationPrice
   };
 }
 
@@ -725,6 +792,7 @@ function checkAccumulationRules(
 
   const monthlyExitRequired =
     policy.monthlyAccumulationExit &&
+    !policy.manualAccumulationExit &&
     accumulation.enabled &&
     position.side !== "FLAT" &&
     accumulation.monthKey !== null &&
@@ -736,6 +804,15 @@ function checkAccumulationRules(
     (
       proposedDecision === position.side
     );
+
+  const totalEntries = Math.max(
+    runtime.accumulationTotalEntries,
+    accumulation.entriesTotal
+  );
+
+  const totalAddLimitReached =
+    sameSideAdd &&
+    totalEntries >= policy.maxAccumulationEntries;
 
   const dailyAddLimitReached =
     sameSideAdd &&
@@ -752,16 +829,236 @@ function checkAccumulationRules(
     dailyEntries,
     maxDailyEntries:
       policy.maxDailyAccumulationEntries,
+    totalEntries,
+    maxTotalEntries:
+      policy.maxAccumulationEntries,
     monthlyExitRequired,
-    dailyAddLimitReached
+    dailyAddLimitReached,
+    totalAddLimitReached
+  };
+}
+
+function calculateBpsDistance(priceA, priceB) {
+  if (
+    priceA === null ||
+    priceB === null ||
+    priceA <= 0 ||
+    priceB <= 0
+  ) {
+    return null;
+  }
+
+  return Math.abs(priceA - priceB) / priceB * 10_000;
+}
+
+function getDcaSymbol(state) {
+  if (
+    state &&
+    typeof state === "object" &&
+    !Array.isArray(state)
+  ) {
+    const symbol =
+      state.symbol ??
+      state.market?.symbol ??
+      state.position?.symbol;
+
+    if (typeof symbol === "string" && symbol.trim()) {
+      return symbol.trim().toUpperCase();
+    }
+  }
+
+  return null;
+}
+
+function isBtcAccumulation(state, position, policy) {
+  const accumulation =
+    getAccumulationState(state, position);
+
+  return (
+    policy.dcaSymbol === "BTCUSDT" &&
+    getDcaSymbol(state) === "BTCUSDT" &&
+    position.side === "LONG" &&
+    accumulation.enabled
+  );
+}
+
+function getDcaState(
+  state,
+  position,
+  accumulation,
+  policy,
+  proposedDecision
+) {
+  const currentPrice =
+    position.markPrice ??
+    (
+      state &&
+      typeof state === "object"
+        ? positiveNumberOrNull(
+            state.price ?? state.market?.price
+          )
+        : null
+    );
+
+  const lastAccumulationPrice =
+    accumulation.lastAccumulationPrice ??
+    position.entryPrice ??
+    null;
+
+  const distanceBps =
+    calculateBpsDistance(
+      currentPrice,
+      lastAccumulationPrice
+    );
+
+  const symbol = getDcaSymbol(state);
+
+  const sameSide =
+    position.side !== "FLAT" &&
+    proposedDecision === position.side;
+
+  const btcLongOnly =
+    policy.dcaSymbol === "BTCUSDT" &&
+    symbol === "BTCUSDT" &&
+    position.side === "LONG";
+
+  const enabled =
+    policy.dcaEnabled &&
+    accumulation.enabled &&
+    btcLongOnly;
+
+  const eligibleBase =
+    enabled &&
+    sameSide &&
+    (!policy.dcaLongOnly || position.side === "LONG");
+
+  const distancePassed =
+    currentPrice !== null &&
+    lastAccumulationPrice !== null &&
+    (
+      (position.side === "LONG" &&
+        currentPrice <=
+          lastAccumulationPrice *
+          (1 - policy.minDcaDistanceBps / 10_000)) ||
+      (position.side === "SHORT" &&
+        currentPrice >=
+          lastAccumulationPrice *
+          (1 + policy.minDcaDistanceBps / 10_000))
+    );
+
+  const requestedDcaNotional =
+    positiveNumberOrNull(
+      state?.dcaNotional
+    ) ??
+    positiveNumberOrNull(
+      state?.order?.dcaNotional
+    ) ??
+    positiveNumberOrNull(
+      state?.trade?.dcaNotional
+    );
+
+  const calculatedDcaNotional =
+    position.notional > 0
+      ? position.notional * policy.dcaNotionalFraction
+      : null;
+
+  const rawDcaNotional =
+    requestedDcaNotional ??
+    calculatedDcaNotional;
+
+  const remainingPositionCapacity =
+    Math.max(
+      0,
+      policy.maxPositionNotional - position.notional
+    );
+
+  const proposedNotional =
+    rawDcaNotional === null
+      ? null
+      : Math.min(
+          rawDcaNotional,
+          policy.maxDcaNotional,
+          remainingPositionCapacity
+        );
+
+  const sizePassed =
+    proposedNotional !== null &&
+    proposedNotional > 0;
+
+  let reason = null;
+
+  if (!policy.dcaEnabled) {
+    reason = "DCA is disabled by policy.";
+  } else if (symbol !== policy.dcaSymbol) {
+    reason =
+      `DCA is restricted to ${policy.dcaSymbol}.`;
+  } else if (policy.dcaLongOnly && position.side !== "LONG") {
+    reason = "DCA is restricted to LONG BTC accumulation.";
+  } else if (!accumulation.enabled) {
+    reason = "DCA requires accumulation mode to be enabled.";
+  } else if (!sameSide) {
+    reason = "DCA requires an existing same-side LONG position.";
+  } else if (accumulation.monthlyExitRequired) {
+    reason = "DCA is blocked because monthly accumulation exit is required.";
+  } else if (accumulation.totalAddLimitReached) {
+    reason = "DCA is blocked by the maximum accumulation count.";
+  } else if (accumulation.dailyAddLimitReached) {
+    reason = "DCA is blocked by the daily accumulation limit.";
+  } else if (!distancePassed) {
+    reason = "DCA price-distance requirement has not been met in the adverse direction.";
+  } else if (!sizePassed) {
+    reason = "DCA has no remaining position capacity or valid add size.";
+  }
+
+  return {
+    enabled,
+    symbol,
+    targetSymbol: policy.dcaSymbol,
+    longOnly: policy.dcaLongOnly,
+    eligible:
+      eligibleBase &&
+      !accumulation.monthlyExitRequired &&
+      !accumulation.dailyAddLimitReached &&
+      !accumulation.totalAddLimitReached &&
+      distancePassed &&
+      sizePassed,
+    currentPrice,
+    lastAccumulationPrice,
+    distanceBps,
+    minDistanceBps: policy.minDcaDistanceBps,
+    requestedNotional: requestedDcaNotional,
+    calculatedNotional: calculatedDcaNotional,
+    proposedNotional,
+    maxDcaNotional: policy.maxDcaNotional,
+    remainingPositionCapacity,
+    reason
   };
 }
 
 function applyAccumulationRules(
   selected,
   accumulation,
-  position
+  position,
+  state,
+  policy
 ) {
+  if (
+    policy.manualAccumulationExit &&
+    isBtcAccumulation(state, position, policy) &&
+    (
+      selected.decision === "EXIT" ||
+      selected.decision === "REDUCE"
+    )
+  ) {
+    return {
+      decision: "WAIT",
+      overridden: true,
+      reasons: [
+        "BTC long-term accumulation is manual-exit only; Jev cannot auto-EXIT or auto-REDUCE it."
+      ]
+    };
+  }
+
   if (accumulation.monthlyExitRequired) {
     // Monthly exit is a hard lifecycle rule. It overrides
     // a normal HOLD/LONG/SHORT decision.
@@ -774,6 +1071,22 @@ function applyAccumulationRules(
         ]
       };
     }
+  }
+
+  if (
+    accumulation.totalAddLimitReached &&
+    (
+      selected.decision === "LONG" ||
+      selected.decision === "SHORT"
+    )
+  ) {
+    return {
+      decision: "WAIT",
+      overridden: true,
+      reasons: [
+        "Maximum accumulation count has been reached."
+      ]
+    };
   }
 
   if (
@@ -799,7 +1112,9 @@ function buildIntent(
   decision,
   state,
   position,
-  policy
+  policy,
+  accumulation = null,
+  dca = null
 ) {
   const requestedNotional =
     getRequestedNotional(state);
@@ -884,6 +1199,20 @@ function buildIntent(
     decision === "LONG" ||
     decision === "SHORT"
   ) {
+    if (
+      dca?.eligible &&
+      position.side === decision
+    ) {
+      return {
+        action: "DCA_ADD",
+        side: decision,
+        notional: dca.proposedNotional,
+        reduceOnly: false,
+        price,
+        reason: `Jev selected ${decision}; DCA add is eligible.`
+      };
+    }
+
     if (
       requestedNotional === null ||
       requestedNotional <= 0
@@ -1017,7 +1346,10 @@ function applyHardSafety(
 
   if (
     cooldown.active &&
-    intent.action === "OPEN_OR_ADD"
+    (
+      intent.action === "OPEN_OR_ADD" ||
+      intent.action === "DCA_ADD"
+    )
   ) {
     blockers.push(
       "Trade decision cooldown is active."
@@ -1056,9 +1388,6 @@ export async function evaluateTrade(
   const evaluation =
     await evaluateMarketState(normalizedState);
 
-  const risk =
-    checkRisk(normalizedState, position, policy);
-
   const selectedBase =
     determineDecision(
       evaluation,
@@ -1081,12 +1410,36 @@ export async function evaluateTrade(
       position
     );
 
+  const dca =
+    getDcaState(
+      normalizedState,
+      position,
+      accumulation,
+      policy,
+      selectedBase.decision
+    );
+
   const intent =
     buildIntent(
       selected.decision,
       normalizedState,
       position,
-      policy
+      policy,
+      accumulation,
+      dca
+    );
+
+  const proposedNotional =
+    intent.action === "DCA_ADD"
+      ? intent.notional
+      : null;
+
+  const risk =
+    checkRisk(
+      normalizedState,
+      position,
+      policy,
+      proposedNotional
     );
 
   const safety =
@@ -1114,18 +1467,28 @@ export async function evaluateTrade(
   runtime.lastDecisionAt = Date.now();
   runtime.lastDecisionFingerprint = fingerprint;
 
-  if (finalIntent.action === "OPEN_OR_ADD") {
+  if (
+    finalIntent.action === "OPEN_OR_ADD" ||
+    finalIntent.action === "DCA_ADD"
+  ) {
     runtime.lastTradeFingerprint = fingerprint;
 
-    // Count only additions to an already-open position.
-    // A fresh FLAT -> LONG/SHORT entry is not an accumulation.
+    // Only an addition to an already-open same-side position
+    // counts toward daily accumulation/DCA limits.
     if (
+      finalIntent.action === "DCA_ADD" &&
       position.side !== "FLAT" &&
       finalIntent.side === position.side &&
       accumulation.enabled
     ) {
       runtime.accumulationEntries =
         accumulation.dailyEntries + 1;
+
+      runtime.accumulationTotalEntries =
+        Math.max(
+          runtime.accumulationTotalEntries,
+          accumulation.totalEntries
+        ) + 1;
 
       runtime.accumulationDate =
         accumulation.currentDate;
@@ -1173,6 +1536,8 @@ export async function evaluateTrade(
     },
 
     accumulation,
+
+    dca,
 
     risk: {
       passed: risk.passed,
@@ -1390,6 +1755,7 @@ export function resetRuntimeState() {
 
   runtime.accumulationEntries = 0;
   runtime.accumulationDate = null;
+  runtime.accumulationTotalEntries = 0;
 
   runtime.killSwitch = false;
 
@@ -1420,6 +1786,9 @@ export function getTraderStatus() {
     accumulationEntries:
       runtime.accumulationEntries,
 
+    accumulationTotalEntries:
+      runtime.accumulationTotalEntries,
+
     accumulationDate:
       runtime.accumulationDate,
 
@@ -1429,6 +1798,27 @@ export function getTraderStatus() {
 
       maxAccumulationEntries:
         DEFAULT_POLICY.maxAccumulationEntries,
+
+      dcaEnabled:
+        DEFAULT_POLICY.dcaEnabled,
+
+      dcaSymbol:
+        DEFAULT_POLICY.dcaSymbol,
+
+      dcaLongOnly:
+        DEFAULT_POLICY.dcaLongOnly,
+
+      dcaNotionalFraction:
+        DEFAULT_POLICY.dcaNotionalFraction,
+
+      maxDcaNotional:
+        DEFAULT_POLICY.maxDcaNotional,
+
+      minDcaDistanceBps:
+        DEFAULT_POLICY.minDcaDistanceBps,
+
+      manualAccumulationExit:
+        DEFAULT_POLICY.manualAccumulationExit,
 
       monthlyAccumulationExit:
         DEFAULT_POLICY.monthlyAccumulationExit
