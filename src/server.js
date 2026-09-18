@@ -34,7 +34,7 @@ import {
 
 import {
   runTrader,
-  getTraderStatus
+  getEngineStatus
 } from "./trader-engine.js";
 
 import {
