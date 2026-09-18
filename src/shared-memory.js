@@ -1,1020 +1,624 @@
-// Jev Connector
-// Shared Memory Client V1.1
+// shared-memory.js
+// Jev Shared Memory Layer
+// V2.0.0
 //
 // Purpose:
-// - Read relevant information from AI Hub Shared Memory
-// - Provide controlled memory context to Jev
-// - Keep Shared Memory access strictly read-only
-// - Protect Jev from malformed/unbounded memory responses
-// - Prepare the connector for future Trader integration
-//
-// SECURITY BOUNDARY
-// -----------------
-// This module can ONLY perform GET requests.
-//
-// It cannot:
-// - create memories
-// - update memories
-// - archive memories
-// - mark conflicts
-// - request approvals
-// - delete memories
-// - access wallets
-// - access private keys
-// - execute trades
-//
-// Jev evaluates.
-// Shared Memory stores.
-// Risk controls authorize.
-// Execution executes.
-//
-// Environment:
-// MEMORY_API_URL
-// MEMORY_API_KEY
+// - Shared memory for Jev
+// - Safe local fallback
+// - Optional remote Shared Memory Hub
+// - Search memories
+// - Recent memories
+// - Jev memory context
+// - Connection/status diagnostics
+// - Never expose secrets
 //
 // IMPORTANT:
-// Never commit MEMORY_API_KEY to GitHub.
+// This module does NOT contain exchange credentials.
+// It does NOT execute trades.
 
-
-// ============================================================
-// CONFIGURATION
-// ============================================================
-
-const MEMORY_API_URL =
-  process.env.MEMORY_API_URL || "";
+const MEMORY_SERVICE_URL =
+  typeof process.env.SHARED_MEMORY_URL === "string"
+    ? process.env.SHARED_MEMORY_URL.trim().replace(/\/+$/, "")
+    : "";
 
 const MEMORY_API_KEY =
-  process.env.MEMORY_API_KEY || "";
+  typeof process.env.SHARED_MEMORY_API_KEY === "string"
+    ? process.env.SHARED_MEMORY_API_KEY.trim()
+    : "";
 
-const CLIENT_ID =
-  "jev-connector";
+const MAX_MEMORIES = 1000;
 
-const REQUEST_TIMEOUT_MS =
-  readPositiveInteger(
-    process.env.MEMORY_REQUEST_TIMEOUT_MS,
-    10000,
-    1000,
-    30000
-  );
+const memoryStore = [];
 
-const MAX_RESULTS =
-  50;
+const runtime = {
+  configured: Boolean(MEMORY_SERVICE_URL),
+  connected: false,
+  lastConnectionCheck: null,
+  lastError: null,
+  lastWriteAt: null,
+  totalReads: 0,
+  totalWrites: 0,
+  remoteReads: 0,
+  remoteWrites: 0
+};
 
-const MAX_QUERY_LENGTH =
-  500;
+/* =========================================================
+   HELPERS
+   ========================================================= */
 
-const MAX_RESPONSE_BYTES =
-  2 * 1024 * 1024;
-
-const MAX_RETRIES =
-  2;
-
-
-// ============================================================
-// INTEGER CONFIGURATION HELPER
-// ============================================================
-
-function readPositiveInteger(
-  value,
-  fallback,
-  minimum,
-  maximum
-) {
-  const parsed =
-    Number(value);
-
-  if (
-    !Number.isFinite(parsed) ||
-    parsed < minimum
-  ) {
-    return fallback;
-  }
-
-  return Math.min(
-    maximum,
-    Math.floor(parsed)
-  );
+function safeString(value, fallback = "") {
+  return typeof value === "string"
+    ? value.trim()
+    : fallback;
 }
 
-
-// ============================================================
-// CONFIGURATION STATUS
-// ============================================================
-
-export function isSharedMemoryConfigured() {
-  return Boolean(
-    MEMORY_API_URL &&
-    MEMORY_API_KEY
-  );
+function nowIso() {
+  return new Date().toISOString();
 }
 
+function createMemoryId() {
+  return `jev-mem-${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2, 10)}`;
+}
 
-export function getSharedMemoryStatus() {
+function normalizeMemory(input = {}) {
+  const source =
+    input &&
+    typeof input === "object" &&
+    !Array.isArray(input)
+      ? input
+      : {};
+
   return {
-    configured:
-      isSharedMemoryConfigured(),
+    id:
+      safeString(source.id) ||
+      createMemoryId(),
 
-    client:
-      CLIENT_ID,
+    timestamp:
+      safeString(source.timestamp) ||
+      nowIso(),
 
-    readOnly:
-      true,
+    source:
+      safeString(source.source, "jev"),
 
-    baseUrlConfigured:
-      Boolean(MEMORY_API_URL),
+    type:
+      safeString(source.type, "observation"),
 
-    apiKeyConfigured:
-      Boolean(MEMORY_API_KEY),
+    symbol:
+      safeString(source.symbol).toUpperCase() ||
+      null,
 
-    maxResults:
-      MAX_RESULTS,
+    importance:
+      Number.isFinite(Number(source.importance))
+        ? Math.max(
+            0,
+            Math.min(
+              1,
+              Number(source.importance)
+            )
+          )
+        : 0.5,
 
-    timeoutMs:
-      REQUEST_TIMEOUT_MS,
+    content:
+      safeString(source.content),
 
-    retries:
-      MAX_RETRIES
+    metadata:
+      source.metadata &&
+      typeof source.metadata === "object" &&
+      !Array.isArray(source.metadata)
+        ? source.metadata
+        : {}
   };
 }
 
+function trimStore() {
+  while (
+    memoryStore.length >
+    MAX_MEMORIES
+  ) {
+    memoryStore.shift();
+  }
+}
 
-// ============================================================
-// BASE URL
-// ============================================================
+function headers() {
+  const result = {
+    "Content-Type": "application/json"
+  };
 
-function getBaseUrl() {
-  if (!MEMORY_API_URL) {
-    throw new Error(
-      "MEMORY_API_URL is not configured"
-    );
+  if (MEMORY_API_KEY) {
+    result.Authorization =
+      `Bearer ${MEMORY_API_KEY}`;
   }
 
-  let url;
+  return result;
+}
+
+/* =========================================================
+   LOCAL MEMORY
+   ========================================================= */
+
+function saveLocalMemory(memory) {
+  const normalized =
+    normalizeMemory(memory);
+
+  if (!normalized.content) {
+    return null;
+  }
+
+  memoryStore.push(normalized);
+  trimStore();
+
+  runtime.totalWrites += 1;
+  runtime.lastWriteAt = nowIso();
+
+  return normalized;
+}
+
+function searchLocalMemories(
+  query,
+  options = {}
+) {
+  const text =
+    safeString(query).toLowerCase();
+
+  const limit =
+    Number.isFinite(Number(options.limit))
+      ? Math.max(
+          1,
+          Math.min(
+            100,
+            Number(options.limit)
+          )
+        )
+      : 20;
+
+  if (!text) {
+    return memoryStore
+      .slice(-limit)
+      .reverse();
+  }
+
+  const terms =
+    text
+      .split(/\s+/)
+      .filter(Boolean);
+
+  return memoryStore
+    .map((memory) => {
+      const haystack =
+        `${memory.content} ${
+          memory.symbol || ""
+        } ${
+          memory.type || ""
+        }`.toLowerCase();
+
+      let score = 0;
+
+      for (const term of terms) {
+        if (haystack.includes(term)) {
+          score += 1;
+        }
+      }
+
+      score +=
+        memory.importance * 0.5;
+
+      return {
+        memory,
+        score
+      };
+    })
+    .filter((item) => item.score > 0)
+    .sort(
+      (a, b) =>
+        b.score - a.score
+    )
+    .slice(0, limit)
+    .map((item) => item.memory);
+}
+
+/* =========================================================
+   REMOTE MEMORY
+   ========================================================= */
+
+async function remoteRequest(
+  path,
+  options = {}
+) {
+  if (!MEMORY_SERVICE_URL) {
+    return null;
+  }
+
+  const controller =
+    new AbortController();
+
+  const timeout =
+    setTimeout(
+      () => controller.abort(),
+      5000
+    );
 
   try {
-    url =
-      new URL(
-        MEMORY_API_URL
-      );
-  } catch {
-    throw new Error(
-      "MEMORY_API_URL is invalid"
-    );
-  }
-
-  const isLocal =
-    url.hostname === "localhost" ||
-    url.hostname === "127.0.0.1" ||
-    url.hostname === "::1";
-
-  if (
-    url.protocol !== "https:" &&
-    !isLocal
-  ) {
-    throw new Error(
-      "MEMORY_API_URL must use HTTPS"
-    );
-  }
-
-  return url.toString()
-    .replace(/\/+$/, "");
-}
-
-
-// ============================================================
-// INPUT VALIDATION
-// ============================================================
-
-function validateQuery(query) {
-  if (
-    typeof query !== "string"
-  ) {
-    throw new TypeError(
-      "Shared Memory query must be a string"
-    );
-  }
-
-  const cleaned =
-    query.trim();
-
-  if (!cleaned) {
-    throw new Error(
-      "Shared Memory query cannot be empty"
-    );
-  }
-
-  if (
-    cleaned.length >
-    MAX_QUERY_LENGTH
-  ) {
-    throw new Error(
-      `Shared Memory query exceeds ${MAX_QUERY_LENGTH} characters`
-    );
-  }
-
-  return cleaned;
-}
-
-
-function validateId(id) {
-  if (
-    typeof id !== "string"
-  ) {
-    throw new TypeError(
-      "Memory ID must be a string"
-    );
-  }
-
-  const cleaned =
-    id.trim();
-
-  if (!cleaned) {
-    throw new Error(
-      "Memory ID cannot be empty"
-    );
-  }
-
-  if (
-    cleaned.length > 200
-  ) {
-    throw new Error(
-      "Memory ID is too long"
-    );
-  }
-
-  return cleaned;
-}
-
-
-// ============================================================
-// LIMIT HELPER
-// ============================================================
-
-function normalizeLimit(
-  value,
-  fallback = 20
-) {
-  const parsed =
-    Number(value);
-
-  if (
-    !Number.isFinite(parsed)
-  ) {
-    return fallback;
-  }
-
-  return Math.min(
-    MAX_RESULTS,
-    Math.max(
-      1,
-      Math.floor(parsed)
-    )
-  );
-}
-
-
-// ============================================================
-// RESPONSE VALIDATION
-// ============================================================
-
-function validateResponseSize(
-  contentLength
-) {
-  if (
-    !contentLength
-  ) {
-    return;
-  }
-
-  const bytes =
-    Number(contentLength);
-
-  if (
-    Number.isFinite(bytes) &&
-    bytes > MAX_RESPONSE_BYTES
-  ) {
-    throw new Error(
-      "Shared Memory response is too large"
-    );
-  }
-}
-
-
-// ============================================================
-// RETRY POLICY
-// ============================================================
-//
-// Only retry safe GET requests.
-// Never retry mutations here because this client
-// does not permit mutations in the first place.
-
-function shouldRetry(
-  status
-) {
-  return (
-    status === 408 ||
-    status === 429 ||
-    status >= 500
-  );
-}
-
-
-function retryDelay(
-  attempt
-) {
-  /*
-   * Small exponential backoff:
-   * attempt 0 -> 250ms
-   * attempt 1 -> 500ms
-   */
-
-  return (
-    250 *
-    Math.pow(
-      2,
-      attempt
-    )
-  );
-}
-
-
-async function sleep(
-  milliseconds
-) {
-  await new Promise(
-    resolve =>
-      setTimeout(
-        resolve,
-        milliseconds
-      )
-  );
-}
-
-
-// ============================================================
-// HTTP CLIENT
-// ============================================================
-
-async function memoryRequest(
-  path
-) {
-  if (
-    !isSharedMemoryConfigured()
-  ) {
-    throw new Error(
-      "Shared Memory client is not configured"
-    );
-  }
-
-  const baseUrl =
-    getBaseUrl();
-
-  const url =
-    new URL(
-      path,
-      `${baseUrl}/`
-    );
-
-
-  /*
-   * Hard read-only boundary.
-   *
-   * This function intentionally has no
-   * method argument.
-   *
-   * Every request is GET.
-   */
-
-  for (
-    let attempt = 0;
-    attempt <= MAX_RETRIES;
-    attempt += 1
-  ) {
-
-    const controller =
-      new AbortController();
-
-    const timeout =
-      setTimeout(
-        () => {
-          controller.abort();
-        },
-        REQUEST_TIMEOUT_MS
-      );
-
-
-    try {
-
-      const response =
-        await fetch(
-          url,
-          {
-            method: "GET",
-
-            headers: {
-              Accept:
-                "application/json",
-
-              Authorization:
-                `Bearer ${MEMORY_API_KEY}`,
-
-              "x-ai-client":
-                CLIENT_ID
-            },
-
-            signal:
-              controller.signal
-          }
-        );
-
-
-      validateResponseSize(
-        response.headers.get(
-          "content-length"
-        )
-      );
-
-
-      /*
-       * Retry temporary server/rate-limit
-       * responses.
-       */
-
-      if (
-        !response.ok &&
-        shouldRetry(
-          response.status
-        ) &&
-        attempt < MAX_RETRIES
-      ) {
-
-        await sleep(
-          retryDelay(
-            attempt
-          )
-        );
-
-        continue;
-      }
-
-
-      let body;
-
-      try {
-        body =
-          await response.json();
-      } catch {
-        throw new Error(
-          "Shared Memory returned invalid JSON"
-        );
-      }
-
-
-      if (
-        !response.ok
-      ) {
-
-        const message =
-          typeof body?.error === "string"
-            ? body.error
-            : typeof body?.error?.message === "string"
-              ? body.error.message
-              : `Shared Memory request failed with HTTP ${response.status}`;
-
-        throw new Error(
-          message
-        );
-      }
-
-
-      return body;
-
-    } catch (error) {
-
-      if (
-        error?.name ===
-        "AbortError"
-      ) {
-
-        if (
-          attempt < MAX_RETRIES
-        ) {
-          await sleep(
-            retryDelay(
-              attempt
-            )
-          );
-
-          continue;
+    const response =
+      await fetch(
+        `${MEMORY_SERVICE_URL}${path}`,
+        {
+          ...options,
+          headers: {
+            ...headers(),
+            ...(options.headers || {})
+          },
+          signal:
+            controller.signal
         }
+      );
 
-        throw new Error(
-          "Shared Memory request timed out"
-        );
-      }
+    if (!response.ok) {
+      throw new Error(
+        `Shared Memory HTTP ${response.status}`
+      );
+    }
 
+    runtime.connected = true;
+    runtime.lastConnectionCheck =
+      nowIso();
+    runtime.lastError = null;
 
-      /*
-       * Network failures are safe to retry
-       * because this client only performs GET.
-       */
+    return await response.json();
+  } catch (error) {
+    runtime.connected = false;
+    runtime.lastConnectionCheck =
+      nowIso();
 
-      if (
-        attempt < MAX_RETRIES &&
-        !error?.message?.includes(
-          "returned invalid JSON"
-        )
-      ) {
+    runtime.lastError =
+      error instanceof Error
+        ? error.message
+        : "Unknown shared-memory error";
 
-        await sleep(
-          retryDelay(
-            attempt
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/* =========================================================
+   CONNECTION
+   ========================================================= */
+
+export async function checkSharedMemoryConnection() {
+  if (!MEMORY_SERVICE_URL) {
+    runtime.configured = false;
+    runtime.connected = false;
+    runtime.lastConnectionCheck =
+      nowIso();
+
+    return {
+      configured: false,
+      connected: false,
+      mode: "local-fallback",
+      reason:
+        "SHARED_MEMORY_URL is not configured."
+    };
+  }
+
+  const result =
+    await remoteRequest("/health");
+
+  if (!result) {
+    return {
+      configured: true,
+      connected: false,
+      mode: "remote",
+      reason:
+        runtime.lastError ||
+        "Shared Memory service is unavailable."
+    };
+  }
+
+  return {
+    configured: true,
+    connected: true,
+    mode: "remote",
+    reason: null
+  };
+}
+
+/* =========================================================
+   WRITE
+   ========================================================= */
+
+export async function getSharedMemory(
+  options = {}
+) {
+  runtime.totalReads += 1;
+
+  const limit =
+    Number.isFinite(Number(options.limit))
+      ? Math.max(
+          1,
+          Math.min(
+            100,
+            Number(options.limit)
           )
-        );
+        )
+      : 50;
 
-        continue;
-      }
+  if (MEMORY_SERVICE_URL) {
+    const result =
+      await remoteRequest(
+        `/memories?limit=${limit}`
+      );
 
+    if (
+      result &&
+      Array.isArray(result.memories)
+    ) {
+      runtime.remoteReads += 1;
 
-      throw error;
-
-    } finally {
-
-      clearTimeout(
-        timeout
+      return result.memories.map(
+        normalizeMemory
       );
     }
   }
 
-
-  throw new Error(
-    "Shared Memory request failed"
-  );
+  return memoryStore
+    .slice(-limit)
+    .reverse();
 }
 
-
-// ============================================================
-// GET ONE MEMORY
-// ============================================================
-
-export async function getSharedMemory(
-  id
+export async function saveSharedMemory(
+  memory
 ) {
-  const memoryId =
-    validateId(id);
+  const normalized =
+    normalizeMemory(memory);
 
-  const result =
-    await memoryRequest(
-      `/api/memories/${encodeURIComponent(memoryId)}`
+  if (!normalized.content) {
+    throw new Error(
+      "Memory content is required."
     );
-
-  if (
-    !result ||
-    typeof result !== "object"
-  ) {
-    return null;
   }
 
-  return (
-    result.memory ||
-    null
+  if (MEMORY_SERVICE_URL) {
+    const result =
+      await remoteRequest(
+        "/memories",
+        {
+          method: "POST",
+          body: JSON.stringify(
+            normalized
+          )
+        }
+      );
+
+    if (result) {
+      runtime.remoteWrites += 1;
+      runtime.totalWrites += 1;
+      runtime.lastWriteAt =
+        nowIso();
+
+      return (
+        result.memory ||
+        normalized
+      );
+    }
+  }
+
+  return saveLocalMemory(
+    normalized
   );
 }
 
-
-// ============================================================
-// SEARCH MEMORY
-// ============================================================
+/* =========================================================
+   SEARCH
+   ========================================================= */
 
 export async function searchSharedMemory(
   query,
   options = {}
 ) {
-  const cleanedQuery =
-    validateQuery(query);
+  runtime.totalReads += 1;
 
-  const params =
-    new URLSearchParams();
+  const text =
+    safeString(query);
 
-  params.set(
-    "q",
-    cleanedQuery
-  );
-
-
-  /*
-   * The Shared Memory server currently
-   * defaults search to ACTIVE.
-   *
-   * We make that explicit for Jev.
-   */
-
-  params.set(
-    "status",
-    typeof options.status === "string" &&
-    options.status.trim()
-      ? options.status.trim()
-      : "ACTIVE"
-  );
-
-
-  if (
-    typeof options.category === "string" &&
-    options.category.trim()
-  ) {
-    params.set(
-      "category",
-      options.category.trim()
-    );
-  }
-
-
-  if (
-    typeof options.source_ai === "string" &&
-    options.source_ai.trim()
-  ) {
-    params.set(
-      "source_ai",
-      options.source_ai.trim()
-    );
-  }
-
-
-  if (
-    typeof options.related_project === "string" &&
-    options.related_project.trim()
-  ) {
-    params.set(
-      "related_project",
-      options.related_project.trim()
-    );
-  }
-
-
-  const limit =
-    normalizeLimit(
-      options.limit,
-      20
-    );
-
-  params.set(
-    "limit",
-    String(limit)
-  );
-
-
-  const result =
-    await memoryRequest(
-      `/api/search?${params.toString()}`
-    );
-
-
-  if (
-    !Array.isArray(
-      result?.results
-    )
-  ) {
+  if (!text) {
     return [];
   }
 
-
-  /*
-   * Enforce our own maximum even if the
-   * upstream server changes its limits.
-   */
-
-  return result.results
-    .slice(
-      0,
-      MAX_RESULTS
-    );
-}
-
-
-// ============================================================
-// GET RECENT MEMORIES
-// ============================================================
-
-export async function getRecentMemories(
-  options = {}
-) {
   const limit =
-    normalizeLimit(
-      options.limit,
-      20
-    );
+    Number.isFinite(Number(options.limit))
+      ? Math.max(
+          1,
+          Math.min(
+            100,
+            Number(options.limit)
+          )
+        )
+      : 20;
 
+  if (MEMORY_SERVICE_URL) {
+    const encoded =
+      encodeURIComponent(text);
 
-  const params =
-    new URLSearchParams();
-
-  params.set(
-    "limit",
-    String(limit)
-  );
-
-
-  if (
-    options.includeArchived === true
-  ) {
-    params.set(
-      "includeArchived",
-      "true"
-    );
-  }
-
-
-  const result =
-    await memoryRequest(
-      `/api/memories?${params.toString()}`
-    );
-
-
-  if (
-    !Array.isArray(
-      result?.memories
-    )
-  ) {
-    return [];
-  }
-
-
-  return result.memories
-    .slice(
-      0,
-      MAX_RESULTS
-    );
-}
-
-
-// ============================================================
-// MEMORY STATISTICS
-// ============================================================
-
-export async function getSharedMemoryStats() {
-  const result =
-    await memoryRequest(
-      "/api/stats"
-    );
-
-
-  return (
-    result?.stats ||
-    null
-  );
-}
-
-
-// ============================================================
-// BUILD JEV MEMORY CONTEXT
-// ============================================================
-//
-// Searches several topics and removes duplicate
-// memories before returning them.
-//
-// Important:
-// This function only retrieves memory.
-// It does NOT evaluate the memory.
-//
-// Jev remains responsible for evaluation.
-
-export async function buildJevMemoryContext(
-  queries = [],
-  options = {}
-) {
-  if (
-    !Array.isArray(queries)
-  ) {
-    throw new TypeError(
-      "queries must be an array"
-    );
-  }
-
-
-  const cleanedQueries =
-    queries
-      .filter(
-        query =>
-          typeof query === "string"
-      )
-      .map(
-        query =>
-          query.trim()
-      )
-      .filter(Boolean)
-      .slice(0, 10);
-
-
-  if (
-    cleanedQueries.length === 0
-  ) {
-    return {
-      memories: [],
-      count: 0,
-      queries: []
-    };
-  }
-
-
-  const memoryMap =
-    new Map();
-
-
-  /*
-   * Sequential search deliberately keeps
-   * pressure on the Shared Memory service low.
-   */
-
-  for (
-    const query of cleanedQueries
-  ) {
-
-    const results =
-      await searchSharedMemory(
-        query,
-        {
-          ...options,
-          limit:
-            options.limit || 10
-        }
+    const result =
+      await remoteRequest(
+        `/memories/search?q=${encoded}&limit=${limit}`
       );
-
-
-    for (
-      const memory of results
-    ) {
-
-      if (
-        memory &&
-        typeof memory.id === "string"
-      ) {
-
-        memoryMap.set(
-          memory.id,
-          memory
-        );
-      }
-    }
-
-
-    /*
-     * Stop once we have enough unique
-     * memories for this evaluation.
-     */
 
     if (
-      memoryMap.size >=
-      MAX_RESULTS
+      result &&
+      Array.isArray(result.memories)
     ) {
-      break;
+      runtime.remoteReads += 1;
+
+      return result.memories.map(
+        normalizeMemory
+      );
     }
   }
 
-
-  const memories =
-    [...memoryMap.values()]
-      .slice(
-        0,
-        MAX_RESULTS
-      );
-
-
-  return {
-    memories,
-    count:
-      memories.length,
-    queries:
-      cleanedQueries
-  };
+  return searchLocalMemories(
+    text,
+    { limit }
+  );
 }
 
+/* =========================================================
+   RECENT MEMORIES
+   ========================================================= */
 
-// ============================================================
-// JEV MEMORY SNAPSHOT
-// ============================================================
-//
-// Provides a clearly-labelled read-only snapshot.
-//
-// No secrets are included.
-// No API metadata is forwarded.
-
-export async function getJevMemorySnapshot(
-  queries = [],
-  options = {}
+export async function getRecentMemories(
+  limit = 20
 ) {
-  const context =
-    await buildJevMemoryContext(
-      queries,
-      options
+  const safeLimit =
+    Math.max(
+      1,
+      Math.min(
+        100,
+        Number(limit) || 20
+      )
     );
 
+  return getSharedMemory({
+    limit: safeLimit
+  });
+}
+
+/* =========================================================
+   JEV MEMORY CONTEXT
+   ========================================================= */
+
+export async function buildJevMemoryContext(
+  state = {},
+  options = {}
+) {
+  const symbol =
+    safeString(
+      state?.symbol ??
+      state?.market?.symbol
+    ).toUpperCase();
+
+  const query =
+    symbol
+      ? `Jev ${symbol} trading market risk accumulation`
+      : "Jev trading market risk accumulation";
+
+  const memories =
+    await searchSharedMemory(
+      query,
+      {
+        limit:
+          options.limit ?? 10
+      }
+    );
 
   return {
-    source:
-      "AI Hub Shared Memory",
+    symbol: symbol || null,
 
-    consumer:
-      "jev-connector",
-
-    access:
-      "read-only",
+    memories,
 
     count:
-      context.count,
+      memories.length,
 
-    queries:
-      context.queries,
-
-    memories:
-      context.memories
+    generatedAt:
+      nowIso()
   };
 }
 
+/* =========================================================
+   SNAPSHOT
+   ========================================================= */
 
-// ============================================================
-// CONNECTION CHECK
-// ============================================================
-//
-// Returns operational status without returning
-// internal error messages or credentials.
+export async function getJevMemorySnapshot() {
+  const recent =
+    await getRecentMemories(20);
 
-export async function checkSharedMemoryConnection() {
-  if (
-    !isSharedMemoryConfigured()
-  ) {
-    return {
-      ok: false,
-      configured: false,
-      connected: false,
-      readOnly: true
-    };
-  }
+  return {
+    engine: "Jev",
+    generatedAt: nowIso(),
 
+    memories: recent,
 
-  try {
+    stats:
+      getSharedMemoryStats(),
 
-    const stats =
-      await getSharedMemoryStats();
-
-
-    return {
-      ok: true,
-
-      configured:
-        true,
-
-      connected:
-        true,
-
-      readOnly:
-        true,
-
-      statsAvailable:
-        stats !== null
-    };
-
-  } catch {
-
-    /*
-     * Do not expose internal connection
-     * details through this health result.
-     */
-
-    return {
-      ok: false,
-
-      configured:
-        true,
-
-      connected:
-        false,
-
-      readOnly:
-        true,
-
-      statsAvailable:
-        false
-    };
-  }
+    status:
+      getSharedMemoryStatus()
+  };
 }
 
+/* =========================================================
+   STATS
+   ========================================================= */
 
-// ============================================================
-// DEFAULT EXPORT
-// ============================================================
-//
-// Explicitly exposes only read operations.
-//
-// There is intentionally NO write API.
+export function getSharedMemoryStats() {
+  return {
+    localMemoryCount:
+      memoryStore.length,
+
+    totalReads:
+      runtime.totalReads,
+
+    totalWrites:
+      runtime.totalWrites,
+
+    remoteReads:
+      runtime.remoteReads,
+
+    remoteWrites:
+      runtime.remoteWrites,
+
+    lastWriteAt:
+      runtime.lastWriteAt
+  };
+}
+
+/* =========================================================
+   STATUS
+   ========================================================= */
+
+export function getSharedMemoryStatus() {
+  return {
+    configured:
+      Boolean(
+        MEMORY_SERVICE_URL
+      ),
+
+    connected:
+      runtime.connected,
+
+    mode:
+      MEMORY_SERVICE_URL
+        ? "remote-with-local-fallback"
+        : "local-fallback",
+
+    readOnly:
+      false,
+
+    lastConnectionCheck:
+      runtime.lastConnectionCheck,
+
+    lastError:
+      runtime.lastError,
+
+    memoryCount:
+      memoryStore.length
+  };
+}
+
+/* =========================================================
+   DEFAULT EXPORT
+   ========================================================= */
 
 export default {
   getSharedMemory,
+  saveSharedMemory,
   searchSharedMemory,
   getRecentMemories,
   getSharedMemoryStats,
   buildJevMemoryContext,
   getJevMemorySnapshot,
   checkSharedMemoryConnection,
-  isSharedMemoryConfigured,
   getSharedMemoryStatus
 };
