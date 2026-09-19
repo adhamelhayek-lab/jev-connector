@@ -9,15 +9,19 @@
 // - Shared memory
 // - Health and diagnostics
 //
+// AUTHENTICATION
+// - Authorization: Bearer <JEV_API_KEY>
+// - X-JEV-API-Key: <JEV_API_KEY>
+// - X-API-Key: <JEV_API_KEY>
+//
 // SAFETY
 // - Paper trading by default
 // - This server does NOT execute trades
-// - No runTrader
-// - No getTraderStatus
-// - No getEngineStatus
-// - API authentication for protected operations
-// - Public diagnostics for easy monitoring
-// - Secrets are never returned
+// - No exchange executor
+// - No wallet access
+// - No private keys
+// - No withdrawals
+// - Protected operations require authentication
 // ============================================================
 
 import express from "express";
@@ -65,7 +69,9 @@ const VERSION =
 // ============================================================
 
 const JEV_API_KEY =
-  process.env.JEV_API_KEY || "";
+  String(
+    process.env.JEV_API_KEY || ""
+  ).trim();
 
 
 // ============================================================
@@ -82,11 +88,7 @@ const LIVE_TRADING =
     process.env.LIVE_TRADING ?? "false"
   ).toLowerCase() === "true";
 
-
-// The connector itself never executes trades.
-//
-// This flag is informational only and does not
-// activate an exchange executor.
+// The connector itself NEVER executes trades.
 
 const LIVE_MODE =
   LIVE_TRADING === true &&
@@ -102,15 +104,18 @@ app.disable("x-powered-by");
 app.use(
   cors({
     origin: true,
+
     methods: [
       "GET",
       "POST",
       "OPTIONS",
     ],
+
     allowedHeaders: [
       "Content-Type",
       "Authorization",
       "X-JEV-API-Key",
+      "X-API-Key",
       "X-Request-ID",
     ],
   })
@@ -128,28 +133,30 @@ app.use(
 // REQUEST ID
 // ============================================================
 
-app.use((req, res, next) => {
+app.use(
+  (req, res, next) => {
 
-  const incoming =
-    req.headers["x-request-id"];
+    const incoming =
+      req.headers["x-request-id"];
 
-  const requestId =
-    typeof incoming === "string" &&
-    incoming.length <= 100
-      ? incoming
-      : crypto.randomUUID();
+    const requestId =
+      typeof incoming === "string" &&
+      incoming.length <= 100 &&
+      incoming.trim().length > 0
+        ? incoming.trim()
+        : crypto.randomUUID();
 
-  req.requestId =
-    requestId;
+    req.requestId =
+      requestId;
 
-  res.setHeader(
-    "X-Request-ID",
-    requestId
-  );
+    res.setHeader(
+      "X-Request-ID",
+      requestId
+    );
 
-  next();
-
-});
+    next();
+  }
+);
 
 
 // ============================================================
@@ -174,16 +181,17 @@ function getClientAddress(req) {
   if (
     typeof forwarded === "string"
   ) {
+
     return forwarded
       .split(",")[0]
       .trim();
+
   }
 
   return (
     req.socket?.remoteAddress ||
     "unknown"
   );
-
 }
 
 
@@ -213,7 +221,6 @@ function rateLimit(req, res, next) {
       address,
       record
     );
-
   }
 
   record.count++;
@@ -234,49 +241,59 @@ function rateLimit(req, res, next) {
         req.requestId,
 
     });
-
   }
 
   next();
-
 }
 
 
 app.use(rateLimit);
 
 
-// Periodically clean old entries.
+// Clean old rate-limit records.
 
-setInterval(() => {
+setInterval(
+  () => {
 
-  const now =
-    Date.now();
+    const now =
+      Date.now();
 
-  for (
-    const [
-      address,
-      record
-    ] of rateStore
-  ) {
-
-    if (
-      now - record.startedAt >
-      RATE_WINDOW
+    for (
+      const [
+        address,
+        record
+      ] of rateStore
     ) {
 
-      rateStore.delete(
-        address
-      );
+      if (
+        now - record.startedAt >
+        RATE_WINDOW
+      ) {
 
+        rateStore.delete(
+          address
+        );
+      }
     }
 
-  }
-
-}, RATE_WINDOW).unref();
+  },
+  RATE_WINDOW
+).unref();
 
 
 // ============================================================
 // AUTHENTICATION
+// ============================================================
+//
+// Accepted:
+//
+// Authorization: Bearer YOUR_KEY
+//
+// X-JEV-API-Key: YOUR_KEY
+//
+// X-API-Key: YOUR_KEY
+//
+// All three must match JEV_API_KEY.
 // ============================================================
 
 function secureCompare(
@@ -292,14 +309,19 @@ function secureCompare(
   }
 
   const a =
-    Buffer.from(first);
+    Buffer.from(
+      first,
+      "utf8"
+    );
 
   const b =
-    Buffer.from(second);
+    Buffer.from(
+      second,
+      "utf8"
+    );
 
   if (
-    a.length !==
-    b.length
+    a.length !== b.length
   ) {
     return false;
   }
@@ -308,7 +330,6 @@ function secureCompare(
     a,
     b
   );
-
 }
 
 
@@ -318,44 +339,108 @@ function authenticate(
   next
 ) {
 
-  // Development/open mode if no key
-  // is configured.
+  // Fail closed.
+  //
+  // If JEV_API_KEY is missing from Render,
+  // protected endpoints cannot be accessed.
 
   if (!JEV_API_KEY) {
-    return next();
+
+    console.error(
+      "[JEV AUTH] JEV_API_KEY is not configured"
+    );
+
+    return res.status(503).json({
+
+      ok: false,
+
+      error:
+        "Authentication is not configured",
+
+      requestId:
+        req.requestId,
+
+    });
   }
+
+
+  // ----------------------------------------------------------
+  // Authorization header
+  // ----------------------------------------------------------
 
   const authorization =
-    req.headers.authorization || "";
+    String(
+      req.headers.authorization || ""
+    ).trim();
 
-  let suppliedKey = "";
+  let bearerKey = "";
 
   if (
-    authorization.startsWith(
-      "Bearer "
-    )
+    authorization
+      .toLowerCase()
+      .startsWith("bearer ")
   ) {
 
-    suppliedKey =
-      authorization.slice(7);
-
+    bearerKey =
+      authorization
+        .slice(7)
+        .trim();
   }
+
+
+  // ----------------------------------------------------------
+  // X-JEV-API-Key
+  // ----------------------------------------------------------
+
+  const jevApiKey =
+    String(
+      req.headers["x-jev-api-key"] || ""
+    ).trim();
+
+
+  // ----------------------------------------------------------
+  // X-API-Key
+  // ----------------------------------------------------------
+
+  const apiKey =
+    String(
+      req.headers["x-api-key"] || ""
+    ).trim();
+
+
+  // ----------------------------------------------------------
+  // Choose supplied credential
+  // ----------------------------------------------------------
+
+  const suppliedKey =
+    bearerKey ||
+    jevApiKey ||
+    apiKey;
+
+
+  // ----------------------------------------------------------
+  // No credential
+  // ----------------------------------------------------------
 
   if (!suppliedKey) {
 
-    const headerKey =
-      req.headers[
-        "x-jev-api-key"
-      ];
+    return res.status(401).json({
 
-    if (
-      typeof headerKey === "string"
-    ) {
-      suppliedKey =
-        headerKey;
-    }
+      ok: false,
 
+      error:
+        "Unauthorized",
+
+      requestId:
+        req.requestId,
+
+    });
   }
+
+
+  // ----------------------------------------------------------
+  // Compare securely
+  // ----------------------------------------------------------
 
   if (
     !secureCompare(
@@ -375,11 +460,20 @@ function authenticate(
         req.requestId,
 
     });
-
   }
 
-  next();
 
+  // ----------------------------------------------------------
+  // Authentication successful
+  // ----------------------------------------------------------
+
+  req.authenticated =
+    true;
+
+  req.authenticatedClient =
+    "trusted-client";
+
+  next();
 }
 
 
@@ -401,7 +495,6 @@ function executionInfo() {
       false,
 
   };
-
 }
 
 
@@ -412,7 +505,6 @@ function validObject(value) {
     typeof value === "object" &&
     !Array.isArray(value)
   );
-
 }
 
 
@@ -424,6 +516,7 @@ function cleanLimit(value) {
   if (
     !Number.isFinite(limit)
   ) {
+
     limit = 20;
   }
 
@@ -434,7 +527,6 @@ function cleanLimit(value) {
       Math.floor(limit)
     )
   );
-
 }
 
 
@@ -485,7 +577,6 @@ app.get(
         req.requestId,
 
     });
-
   }
 );
 
@@ -539,7 +630,6 @@ app.get(
         req.requestId,
 
     });
-
   }
 );
 
@@ -584,6 +674,19 @@ app.get(
 
       },
 
+      authentication: {
+
+        methods: [
+          "Bearer",
+          "X-JEV-API-Key",
+          "X-API-Key",
+        ],
+
+        configured:
+          Boolean(JEV_API_KEY),
+
+      },
+
       endpoints: {
 
         health:
@@ -610,7 +713,6 @@ app.get(
         req.requestId,
 
     });
-
   }
 );
 
@@ -644,7 +746,6 @@ app.get(
         "[JEV] Status check:",
         error.message
       );
-
     }
 
     const degraded =
@@ -709,7 +810,6 @@ app.get(
         req.requestId,
 
     });
-
   }
 );
 
@@ -773,15 +873,13 @@ app.get(
           req.requestId,
 
       });
-
     }
-
   }
 );
 
 
 // ============================================================
-// PUBLIC MEMORY CONNECTION TEST
+// PUBLIC MEMORY CONNECTION
 // ============================================================
 
 app.get(
@@ -836,9 +934,7 @@ app.get(
           req.requestId,
 
       });
-
     }
-
   }
 );
 
@@ -846,12 +942,6 @@ app.get(
 // ============================================================
 // MARKET EVALUATION
 // ============================================================
-//
-// Protected endpoint.
-//
-// This evaluates market state.
-// It does NOT place an order.
-//
 
 app.post(
   "/api/evaluate-market",
@@ -865,9 +955,7 @@ app.post(
         req.body;
 
       if (
-        !validObject(
-          marketData
-        )
+        !validObject(marketData)
       ) {
 
         return res.status(400).json({
@@ -881,7 +969,6 @@ app.post(
             req.requestId,
 
         });
-
       }
 
       const result =
@@ -900,6 +987,12 @@ app.post(
           "market-evaluation",
 
         result,
+
+        executed:
+          false,
+
+        execution:
+          executionInfo(),
 
         requestId:
           req.requestId,
@@ -920,13 +1013,14 @@ app.post(
         error:
           "Market evaluation failed",
 
+        executed:
+          false,
+
         requestId:
           req.requestId,
 
       });
-
     }
-
   }
 );
 
@@ -934,13 +1028,6 @@ app.post(
 // ============================================================
 // TRADE EVALUATION
 // ============================================================
-//
-// Protected endpoint.
-//
-// IMPORTANT:
-// evaluateTrade creates/evaluates a trade intent.
-// This connector does NOT execute that intent.
-//
 
 app.post(
   "/api/evaluate-trade",
@@ -972,7 +1059,6 @@ app.post(
             req.requestId,
 
         });
-
       }
 
       if (
@@ -990,7 +1076,6 @@ app.post(
             req.requestId,
 
         });
-
       }
 
       const result =
@@ -1043,9 +1128,7 @@ app.post(
           req.requestId,
 
       });
-
     }
-
   }
 );
 
@@ -1094,9 +1177,7 @@ app.get(
           req.requestId,
 
       });
-
     }
-
   }
 );
 
@@ -1154,9 +1235,7 @@ app.get(
           req.requestId,
 
       });
-
     }
-
   }
 );
 
@@ -1191,10 +1270,11 @@ app.post(
             req.requestId,
 
         });
-
       }
 
-      if (query.length > 500) {
+      if (
+        query.length > 500
+      ) {
 
         return res.status(400).json({
 
@@ -1207,7 +1287,6 @@ app.post(
             req.requestId,
 
         });
-
       }
 
       const result =
@@ -1247,9 +1326,7 @@ app.post(
           req.requestId,
 
       });
-
     }
-
   }
 );
 
@@ -1282,7 +1359,6 @@ app.post(
             req.requestId,
 
         });
-
       }
 
       const result =
@@ -1320,9 +1396,7 @@ app.post(
           req.requestId,
 
       });
-
     }
-
   }
 );
 
@@ -1345,7 +1419,7 @@ app.post(
 
       if (
         typeof input !==
-          "string"
+        "string"
       ) {
 
         return res.status(400).json({
@@ -1359,7 +1433,6 @@ app.post(
             req.requestId,
 
         });
-
       }
 
       const result =
@@ -1397,9 +1470,7 @@ app.post(
           req.requestId,
 
       });
-
     }
-
   }
 );
 
@@ -1448,9 +1519,7 @@ app.get(
           req.requestId,
 
       });
-
     }
-
   }
 );
 
@@ -1476,7 +1545,6 @@ app.use(
         req.requestId,
 
     });
-
   }
 );
 
@@ -1498,7 +1566,6 @@ app.use(
     ) {
 
       return next(error);
-
     }
 
     res.status(500).json({
@@ -1512,7 +1579,6 @@ app.use(
         req.requestId,
 
     });
-
   }
 );
 
@@ -1533,29 +1599,32 @@ function shutdown(signal) {
   if (!server) {
 
     process.exit(0);
-
   }
 
-  server.close(() => {
+  server.close(
+    () => {
 
-    console.log(
-      "[JEV] Server stopped"
-    );
+      console.log(
+        "[JEV] Server stopped"
+      );
 
-    process.exit(0);
+      process.exit(0);
 
-  });
+    }
+  );
 
-  setTimeout(() => {
+  setTimeout(
+    () => {
 
-    console.error(
-      "[JEV] Forced shutdown"
-    );
+      console.error(
+        "[JEV] Forced shutdown"
+      );
 
-    process.exit(1);
+      process.exit(1);
 
-  }, 10000).unref();
-
+    },
+    10000
+  ).unref();
 }
 
 
@@ -1606,6 +1675,22 @@ server =
 
       console.log(
         `Authentication: ${Boolean(JEV_API_KEY)}`
+      );
+
+      console.log(
+        "Accepted API headers:"
+      );
+
+      console.log(
+        "- Authorization: Bearer"
+      );
+
+      console.log(
+        "- X-JEV-API-Key"
+      );
+
+      console.log(
+        "- X-API-Key"
       );
 
       console.log(
