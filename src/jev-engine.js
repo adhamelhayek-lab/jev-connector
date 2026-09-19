@@ -1,16 +1,15 @@
 // jev-engine.js
-// Jev Trading Evaluation Engine V4.0.0
+// Jev Engine V5.0.0
 //
 // Purpose:
-// - Market evaluation only
-// - Uses current OpenRouter-compatible API
-// - Uses TypeSafe Jev
-// - Returns structured trading evaluation
-// - Deterministic safety layer
+// - Market evaluation
+// - Trade evaluation
+// - Structured Jev Decisions API
+// - OpenRouter integration
+// - Strong validation
+// - Timeout + retry protection
+// - Paper-trading only
 // - NEVER executes trades
-// - NEVER accesses wallets
-// - NEVER accesses private keys
-// - NEVER enables live trading
 //
 // Required:
 //   OPENROUTER_API_KEY
@@ -18,51 +17,61 @@
 // Optional:
 //   JEV_MODEL
 //   JEV_TIMEOUT_MS
+//   JEV_MAX_RETRIES
 //
-// Current default model:
-//   ~typesafe/jev-latest
-//
-// Current OpenRouter API:
-//   https://openrouter.ai/api/v1/chat/completions
+// IMPORTANT:
+// Jev 1.13 is a Decisions model.
+// DO NOT use /api/v1/chat/completions.
+
+
+// =========================================================
+// CONFIGURATION
+// =========================================================
 
 const OPENROUTER_URL =
-  "https://openrouter.ai/api/v1/chat/completions";
+  "https://openrouter.ai/api/alpha/decisions";
 
 const JEV_MODEL =
   process.env.JEV_MODEL ||
-  "~typesafe/jev-latest";
+  "typesafe/jev-1.13";
+
+const OPENROUTER_API_KEY =
+  process.env.OPENROUTER_API_KEY ||
+  "";
 
 const TIMEOUT_MS =
-  Number(process.env.JEV_TIMEOUT_MS) || 30000;
+  Number(process.env.JEV_TIMEOUT_MS) > 0
+    ? Number(process.env.JEV_TIMEOUT_MS)
+    : 30000;
 
-const ENGINE_NAME =
-  "Jev Trading Evaluation Engine";
-
-const ENGINE_VERSION =
-  "4.0.0";
-
-const VALID_DECISIONS = new Set([
-  "LONG",
-  "SHORT",
-  "HOLD",
-  "REDUCE",
-  "EXIT",
-  "WAIT"
-]);
-
-const VALID_POSITION_SIDES = new Set([
-  "FLAT",
-  "LONG",
-  "SHORT"
-]);
-
-const MAX_STATE_BYTES = 900000;
-const MAX_RESPONSE_BYTES = 2000000;
+const MAX_RETRIES =
+  Number(process.env.JEV_MAX_RETRIES) >= 0
+    ? Math.min(Number(process.env.JEV_MAX_RETRIES), 2)
+    : 1;
 
 
-// --------------------------------------------------
-// Utility
-// --------------------------------------------------
+// =========================================================
+// CONSTANT SAFETY POLICY
+// =========================================================
+
+const SAFETY_POLICY = Object.freeze({
+  executionAllowed: false,
+  paperTrading: true,
+  liveTrading: false,
+  executorEnabled: false,
+  walletAccess: false,
+  privateKeys: false,
+  withdrawals: false,
+
+  reason:
+    "Jev is evaluation-only. " +
+    "No trade execution is permitted."
+});
+
+
+// =========================================================
+// UTILITIES
+// =========================================================
 
 function isObject(value) {
   return (
@@ -72,828 +81,686 @@ function isObject(value) {
   );
 }
 
-function jsonSize(value) {
-  try {
-    return Buffer.byteLength(
-      JSON.stringify(value),
-      "utf8"
-    );
-  } catch {
-    return Infinity;
-  }
-}
 
-function clamp(value, min, max) {
-  return Math.min(
-    max,
-    Math.max(min, value)
+function isNonEmptyObject(value) {
+  return (
+    isObject(value) &&
+    Object.keys(value).length > 0
   );
 }
 
-function normalizeProbability(value) {
+
+function clamp(value, min = 0, max = 1) {
   const number = Number(value);
 
   if (!Number.isFinite(number)) {
-    return null;
+    return min;
   }
 
-  if (number > 1) {
-    return clamp(number / 100, 0, 1);
-  }
-
-  return clamp(number, 0, 1);
+  return Math.min(
+    max,
+    Math.max(min, number)
+  );
 }
 
-function normalizeDecision(value) {
+
+function createRequestId() {
   if (
-    typeof value !== "string"
+    globalThis.crypto &&
+    typeof globalThis.crypto.randomUUID === "function"
   ) {
-    return null;
+    return globalThis.crypto.randomUUID();
   }
 
-  const decision =
-    value
-      .trim()
-      .toUpperCase();
-
-  return VALID_DECISIONS.has(decision)
-    ? decision
-    : null;
+  return [
+    Date.now().toString(36),
+    Math.random().toString(36).slice(2),
+    Math.random().toString(36).slice(2)
+  ].join("-");
 }
 
 
-// --------------------------------------------------
-// Position
-// --------------------------------------------------
+function sleep(ms) {
+  return new Promise(resolve =>
+    setTimeout(resolve, ms)
+  );
+}
 
-function normalizePosition(position = {}) {
-  const rawSide =
-    typeof position.side === "string"
-      ? position.side.toUpperCase()
-      : "FLAT";
 
+function isRetryableStatus(status) {
+  return (
+    status === 408 ||
+    status === 429 ||
+    status >= 500
+  );
+}
+
+
+// =========================================================
+// MARKET QUESTIONS
+// =========================================================
+
+function getMarketQuestions() {
   return {
-    side:
-      VALID_POSITION_SIDES.has(rawSide)
-        ? rawSide
-        : "FLAT",
+    market_direction: {
+      type: "choice",
 
-    size:
-      Number.isFinite(Number(position.size))
-        ? Number(position.size)
-        : 0,
+      instructions:
+        "Determine the dominant market direction " +
+        "using only the supplied market state.",
 
-    entryPrice:
-      Number.isFinite(Number(position.entryPrice))
-        ? Number(position.entryPrice)
-        : null,
+      criteria: {
+        bullish:
+          "Evidence favors upward market pressure.",
 
-    unrealizedPnl:
-      Number.isFinite(Number(position.unrealizedPnl))
-        ? Number(position.unrealizedPnl)
-        : null
+        bearish:
+          "Evidence favors downward market pressure.",
+
+        sideways:
+          "Evidence does not establish a clear direction."
+      }
+    },
+
+    market_quality: {
+      type: "score",
+
+      instructions:
+        "Evaluate the quality and clarity of the supplied " +
+        "market conditions.",
+
+      criteria: {
+        "0":
+          "Extremely poor or unusable conditions.",
+
+        "0.25":
+          "Weak conditions and substantial uncertainty.",
+
+        "0.5":
+          "Mixed or neutral conditions.",
+
+        "0.75":
+          "Good conditions with reasonable clarity.",
+
+        "1":
+          "Very clear and high-quality conditions."
+      }
+    },
+
+    trade_risk: {
+      type: "score",
+
+      instructions:
+        "Evaluate the apparent risk of taking a directional " +
+        "trade from the supplied market state.",
+
+      criteria: {
+        "0":
+          "Very low apparent risk.",
+
+        "0.25":
+          "Low apparent risk.",
+
+        "0.5":
+          "Moderate risk.",
+
+        "0.75":
+          "High risk.",
+
+        "1":
+          "Very high risk."
+      }
+    },
+
+    trade_opportunity: {
+      type: "score",
+
+      instructions:
+        "Evaluate the quality of the potential opportunity.",
+
+      criteria: {
+        "0":
+          "No meaningful opportunity.",
+
+        "0.25":
+          "Weak opportunity.",
+
+        "0.5":
+          "Moderate opportunity.",
+
+        "0.75":
+          "Good opportunity.",
+
+        "1":
+          "Very strong opportunity."
+      }
+    },
+
+    should_consider_trade: {
+      type: "noul",
+
+      instructions:
+        "Determine whether the supplied market state " +
+        "provides sufficient evidence to consider a trade."
+    }
   };
 }
 
 
-// --------------------------------------------------
-// Validation
-// --------------------------------------------------
+// =========================================================
+// TRADE QUESTIONS
+// =========================================================
 
-function validateMarketData(marketData) {
-  if (!isObject(marketData)) {
-    throw new Error(
-      "Invalid market data"
-    );
-  }
+function getTradeQuestions() {
+  return {
+    trade_direction: {
+      type: "choice",
 
-  if (
-    jsonSize(marketData) >
-    MAX_STATE_BYTES
-  ) {
-    throw new Error(
-      "Market data is too large"
-    );
-  }
+      instructions:
+        "Determine the direction best supported by " +
+        "the supplied trade state.",
 
-  return true;
+      criteria: {
+        long:
+          "Evidence supports a long/buy direction.",
+
+        short:
+          "Evidence supports a short/sell direction.",
+
+        flat:
+          "Evidence does not justify a directional trade."
+      }
+    },
+
+    setup_quality: {
+      type: "score",
+
+      instructions:
+        "Evaluate the quality of the proposed trade setup.",
+
+      criteria: {
+        "0":
+          "Invalid or unusable setup.",
+
+        "0.25":
+          "Weak setup.",
+
+        "0.5":
+          "Average setup.",
+
+        "0.75":
+          "Good setup.",
+
+        "1":
+          "Very strong setup."
+      }
+    },
+
+    risk_level: {
+      type: "score",
+
+      instructions:
+        "Evaluate the risk of the proposed trade.",
+
+      criteria: {
+        "0":
+          "Very low apparent risk.",
+
+        "0.25":
+          "Low risk.",
+
+        "0.5":
+          "Moderate risk.",
+
+        "0.75":
+          "High risk.",
+
+        "1":
+          "Very high risk."
+      }
+    },
+
+    approve_trade: {
+      type: "noul",
+
+      instructions:
+        "Determine whether the proposed trade has enough " +
+        "support to be considered for paper-trading evaluation."
+    }
+  };
 }
 
 
-// --------------------------------------------------
-// System prompt
-// --------------------------------------------------
-
-function buildSystemPrompt() {
-  return `
-You are Jev, a structured market-evaluation engine.
-
-Your job is ONLY to evaluate the supplied market state.
-
-You are NOT a trade executor.
-
-You do NOT:
-- place orders
-- access wallets
-- access private keys
-- withdraw funds
-- change exchange permissions
-- override risk controls
-- invent missing market information
-
-You MUST:
-- use only information supplied in the input
-- distinguish evidence from uncertainty
-- allow WAIT when evidence is insufficient
-- avoid forcing a trade
-- consider the current position
-- consider risk information
-- return exactly one decision
-
-Valid decisions:
-
-LONG
-SHORT
-HOLD
-REDUCE
-EXIT
-WAIT
-
-Decision meanings:
-
-LONG:
-Evidence supports bullish exposure.
-
-SHORT:
-Evidence supports bearish exposure.
-
-HOLD:
-An existing position remains justified.
-
-REDUCE:
-An existing position should have lower exposure.
-
-EXIT:
-An existing position should be closed.
-
-WAIT:
-Evidence is insufficient, contradictory, or uncertain.
-
-Safety has priority over aggressiveness.
-
-If evidence is insufficient or contradictory,
-prefer WAIT.
-
-Return ONLY valid JSON.
-Do not return markdown.
-Do not return explanations outside the JSON.
-`.trim();
-}
-
-
-// --------------------------------------------------
-// User prompt
-// --------------------------------------------------
-
-function buildUserPrompt(
-  marketData,
-  position
-) {
-  return `
-Evaluate the following market state.
-
-MARKET DATA:
-${JSON.stringify(
-  marketData,
-  null,
-  2
-)}
-
-CURRENT POSITION:
-${JSON.stringify(
-  position,
-  null,
-  2
-)}
-
-Return JSON with exactly this structure:
-
-{
-  "decision": "LONG | SHORT | HOLD | REDUCE | EXIT | WAIT",
-  "confidence": 0.0,
-  "bullishProbability": 0.0,
-  "bearishProbability": 0.0,
-  "evidence": {
-    "sufficient": true,
-    "bullishStructure": 0.0,
-    "bearishStructure": 0.0,
-    "accumulation": 0.0,
-    "reversalRisk": 0.0,
-    "thesisInvalidated": 0.0,
-    "riskCompatible": true
-  },
-  "reason": "Short factual explanation based only on supplied data"
-}
-
-All probability values must be between 0 and 1.
-
-Do not invent prices, indicators, news,
-volume data, order flow, or other information.
-`.trim();
-}
-
-
-// --------------------------------------------------
-// JSON extraction
-// --------------------------------------------------
-
-function extractJson(text) {
-  if (
-    typeof text !== "string"
-  ) {
-    return null;
-  }
-
-  const cleaned =
-    text
-      .trim()
-      .replace(/^```json\s*/i, "")
-      .replace(/^```\s*/i, "")
-      .replace(/\s*```$/i, "")
-      .trim();
-
-  try {
-    return JSON.parse(cleaned);
-  } catch {
-    // Try extracting the first JSON object.
-  }
-
-  const start =
-    cleaned.indexOf("{");
-
-  const end =
-    cleaned.lastIndexOf("}");
-
-  if (
-    start === -1 ||
-    end === -1 ||
-    end <= start
-  ) {
-    return null;
-  }
-
-  try {
-    return JSON.parse(
-      cleaned.slice(
-        start,
-        end + 1
-      )
-    );
-  } catch {
-    return null;
-  }
-}
-
-
-// --------------------------------------------------
-// OpenRouter request
-// --------------------------------------------------
+// =========================================================
+// PROVIDER REQUEST
+// =========================================================
 
 async function requestJev(
-  marketData,
-  position
+  state,
+  questions,
+  requestId
 ) {
-  const apiKey =
-    process.env.OPENROUTER_API_KEY;
-
-  if (!apiKey) {
+  if (!OPENROUTER_API_KEY) {
     throw new Error(
       "OPENROUTER_API_KEY is not configured"
     );
   }
 
-  const requestId =
-    `jev-${Date.now()}-${Math.random()
-      .toString(36)
-      .slice(2, 10)}`;
+  let lastError = null;
 
-  const controller =
-    new AbortController();
+  for (
+    let attempt = 0;
+    attempt <= MAX_RETRIES;
+    attempt++
+  ) {
+    const controller =
+      new AbortController();
 
-  const timeout =
-    setTimeout(
-      () => controller.abort(),
-      TIMEOUT_MS
-    );
-
-  try {
-    const response =
-      await fetch(
-        OPENROUTER_URL,
-        {
-          method: "POST",
-
-          headers: {
-            "Authorization":
-              `Bearer ${apiKey}`,
-
-            "Content-Type":
-              "application/json",
-
-            "HTTP-Referer":
-              "https://jev-connector.onrender.com",
-
-            "X-Title":
-              "Jev Trading Evaluation Engine",
-
-            "X-Request-ID":
-              requestId
-          },
-
-          body:
-            JSON.stringify({
-              model:
-                JEV_MODEL,
-
-              messages: [
-                {
-                  role:
-                    "system",
-
-                  content:
-                    buildSystemPrompt()
-                },
-
-                {
-                  role:
-                    "user",
-
-                  content:
-                    buildUserPrompt(
-                      marketData,
-                      position
-                    )
-                }
-              ],
-
-              temperature:
-                0,
-
-              max_tokens:
-                1200
-            }),
-
-          signal:
-            controller.signal
-        }
-      );
-
-    const text =
-      await response.text();
-
-    if (
-      Buffer.byteLength(
-        text,
-        "utf8"
-      ) > MAX_RESPONSE_BYTES
-    ) {
-      throw new Error(
-        "OpenRouter response is too large"
-      );
-    }
-
-    let data;
+    const timeout =
+      setTimeout(() => {
+        controller.abort();
+      }, TIMEOUT_MS);
 
     try {
-      data =
-        JSON.parse(text);
-    } catch {
-      throw new Error(
-        `OpenRouter returned invalid JSON (HTTP ${response.status})`
+      const response =
+        await fetch(
+          OPENROUTER_URL,
+          {
+            method: "POST",
+
+            headers: {
+              "Authorization":
+                `Bearer ${OPENROUTER_API_KEY}`,
+
+              "Content-Type":
+                "application/json",
+
+              "HTTP-Referer":
+                "https://jev-connector.onrender.com",
+
+              "X-Title":
+                "Jev Connector",
+
+              "X-Request-ID":
+                requestId
+            },
+
+            body: JSON.stringify({
+              model: JEV_MODEL,
+              state,
+              questions
+            }),
+
+            signal:
+              controller.signal
+          }
+        );
+
+      const raw =
+        await response.text();
+
+      let data = {};
+
+      if (raw) {
+        try {
+          data = JSON.parse(raw);
+        } catch {
+          throw new Error(
+            `OpenRouter returned invalid JSON: ${raw.slice(0, 300)}`
+          );
+        }
+      }
+
+      if (!response.ok) {
+        const message =
+          data?.error?.message ||
+          data?.message ||
+          `HTTP ${response.status}`;
+
+        const error =
+          new Error(
+            `OpenRouter ${response.status}: ${message}`
+          );
+
+        if (
+          isRetryableStatus(response.status) &&
+          attempt < MAX_RETRIES
+        ) {
+          lastError = error;
+
+          await sleep(
+            500 * (attempt + 1)
+          );
+
+          continue;
+        }
+
+        throw error;
+      }
+
+      if (!isObject(data)) {
+        throw new Error(
+          "OpenRouter returned an invalid response object"
+        );
+      }
+
+      if (!isObject(data.answers)) {
+        throw new Error(
+          "Jev response is missing the 'answers' object"
+        );
+      }
+
+      return data;
+
+    } catch (error) {
+      lastError = error;
+
+      if (
+        error?.name === "AbortError"
+      ) {
+        if (attempt < MAX_RETRIES) {
+          await sleep(
+            500 * (attempt + 1)
+          );
+
+          continue;
+        }
+
+        throw new Error(
+          `Jev request timed out after ${TIMEOUT_MS}ms`
+        );
+      }
+
+      if (attempt >= MAX_RETRIES) {
+        throw error;
+      }
+
+      await sleep(
+        500 * (attempt + 1)
       );
+
+    } finally {
+      clearTimeout(timeout);
     }
-
-    if (!response.ok) {
-      const message =
-        data?.error?.message ||
-        data?.error ||
-        data?.message ||
-        `HTTP ${response.status}`;
-
-      throw new Error(
-        `OpenRouter request failed: ${message}`
-      );
-    }
-
-    const content =
-      data?.choices?.[0]?.message?.content;
-
-    if (
-      typeof content !== "string" ||
-      !content.trim()
-    ) {
-      throw new Error(
-        "Jev returned no decision content"
-      );
-    }
-
-    const parsed =
-      extractJson(content);
-
-    if (!parsed) {
-      throw new Error(
-        "Jev returned non-structured decision data"
-      );
-    }
-
-    return {
-      requestId,
-
-      providerRequestId:
-        data?.id || null,
-
-      model:
-        data?.model ||
-        JEV_MODEL,
-
-      decision:
-        parsed,
-
-      usage:
-        data?.usage || null
-    };
-
-  } catch (error) {
-    if (
-      error?.name ===
-      "AbortError"
-    ) {
-      throw new Error(
-        `Jev request timed out after ${TIMEOUT_MS}ms`
-      );
-    }
-
-    throw error;
-
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-
-// --------------------------------------------------
-// Normalize Jev response
-// --------------------------------------------------
-
-function normalizeDecisionResult(
-  result
-) {
-  const raw =
-    result?.decision || {};
-
-  const decision =
-    normalizeDecision(
-      raw.decision
-    );
-
-  const confidence =
-    normalizeProbability(
-      raw.confidence
-    );
-
-  const bullishProbability =
-    normalizeProbability(
-      raw.bullishProbability
-    );
-
-  const bearishProbability =
-    normalizeProbability(
-      raw.bearishProbability
-    );
-
-  const evidence =
-    isObject(raw.evidence)
-      ? raw.evidence
-      : {};
-
-  return {
-    decision,
-
-    confidence,
-
-    bullishProbability,
-
-    bearishProbability,
-
-    evidence: {
-      sufficient:
-        evidence.sufficient === true,
-
-      bullishStructure:
-        normalizeProbability(
-          evidence.bullishStructure
-        ),
-
-      bearishStructure:
-        normalizeProbability(
-          evidence.bearishStructure
-        ),
-
-      accumulation:
-        normalizeProbability(
-          evidence.accumulation
-        ),
-
-      reversalRisk:
-        normalizeProbability(
-          evidence.reversalRisk
-        ),
-
-      thesisInvalidated:
-        normalizeProbability(
-          evidence.thesisInvalidated
-        ),
-
-      riskCompatible:
-        evidence.riskCompatible === true
-    },
-
-    reason:
-      typeof raw.reason === "string"
-        ? raw.reason.slice(0, 1000)
-        : ""
-  };
-}
-
-
-// --------------------------------------------------
-// Safety / consistency
-// --------------------------------------------------
-
-function analyzeConsistency(
-  result,
-  position
-) {
-  const warnings = [];
-  const hardWarnings = [];
-
-  const decision =
-    result.decision;
-
-  const evidence =
-    result.evidence;
-
-  if (!decision) {
-    hardWarnings.push(
-      "No valid decision returned."
-    );
   }
 
-  if (
-    !evidence.sufficient &&
-    (
-      decision === "LONG" ||
-      decision === "SHORT"
-    )
-  ) {
-    hardWarnings.push(
-      "Directional decision returned despite insufficient evidence."
-    );
-  }
-
-  if (
-    !evidence.riskCompatible
-  ) {
-    hardWarnings.push(
-      "Decision is not risk compatible."
-    );
-  }
-
-  if (
-    evidence.thesisInvalidated !== null &&
-    evidence.thesisInvalidated >= 0.70 &&
-    (
-      decision === "LONG" ||
-      decision === "SHORT" ||
-      position.side !== "FLAT"
-    )
-  ) {
-    hardWarnings.push(
-      "Trading thesis appears invalidated."
-    );
-  }
-
-  if (
-    evidence.reversalRisk !== null &&
-    evidence.reversalRisk >= 0.75 &&
-    (
-      decision === "LONG" ||
-      decision === "SHORT"
-    )
-  ) {
-    warnings.push(
-      "High reversal risk."
-    );
-  }
-
-  if (
-    evidence.bullishStructure !== null &&
-    evidence.bearishStructure !== null &&
-    evidence.bullishStructure >= 0.75 &&
-    evidence.bearishStructure >= 0.75
-  ) {
-    warnings.push(
-      "Bullish and bearish structure are both elevated."
-    );
-  }
-
-  if (
-    position.side === "FLAT" &&
-    (
-      decision === "HOLD" ||
-      decision === "REDUCE" ||
-      decision === "EXIT"
-    )
-  ) {
-    warnings.push(
-      `${decision} returned while position is FLAT.`
-    );
-  }
-
-  return {
-    consistent:
-      hardWarnings.length === 0,
-
-    warnings,
-
-    hardWarnings,
-
-    blockExecution:
-      hardWarnings.length > 0
-  };
-}
-
-
-// --------------------------------------------------
-// Main market evaluation
-// --------------------------------------------------
-
-async function evaluateMarketState(
-  marketData,
-  options = {}
-) {
-  validateMarketData(
-    marketData
+  throw (
+    lastError ||
+    new Error("Jev request failed")
   );
+}
 
-  const position =
-    normalizePosition(
-      marketData.position ||
-      options.currentPosition ||
-      {}
-    );
 
-  const provider =
-    await requestJev(
-      marketData,
-      position
-    );
+// =========================================================
+// ANSWER NORMALIZATION
+// =========================================================
 
-  const normalized =
-    normalizeDecisionResult(
-      provider
-    );
-
-  const consistency =
-    analyzeConsistency(
-      normalized,
-      position
-    );
-
-  /*
-   * Deterministic safety rule:
-   *
-   * If Jev produces an unsafe/inconsistent
-   * directional answer, the connector changes
-   * the result to WAIT.
-   */
-  let finalDecision =
-    normalized.decision;
-
-  if (
-    consistency.blockExecution &&
-    (
-      finalDecision === "LONG" ||
-      finalDecision === "SHORT"
-    )
-  ) {
-    finalDecision =
-      "WAIT";
+function normalizeAnswer(answer) {
+  if (!isObject(answer)) {
+    return {
+      raw: answer
+    };
   }
 
+  const normalized = {};
+
+  if (
+    answer.type !== undefined
+  ) {
+    normalized.type =
+      answer.type;
+  }
+
+  if (
+    answer.choice !== undefined
+  ) {
+    normalized.choice =
+      answer.choice;
+  }
+
+  if (
+    answer.score !== undefined
+  ) {
+    normalized.score =
+      clamp(answer.score);
+  }
+
+  if (
+    answer.noul !== undefined
+  ) {
+    normalized.noul =
+      clamp(answer.noul);
+  }
+
+  if (
+    answer.probabilities !== undefined
+  ) {
+    normalized.probabilities =
+      answer.probabilities;
+  }
+
+  return normalized;
+}
+
+
+function normalizeAnswers(answers) {
+  const output = {};
+
+  for (
+    const [key, value]
+    of Object.entries(answers)
+  ) {
+    output[key] =
+      normalizeAnswer(value);
+  }
+
+  return output;
+}
+
+
+// =========================================================
+// MARKET RESULT
+// =========================================================
+
+function buildMarketResult(providerResult) {
+  const answers =
+    normalizeAnswers(
+      providerResult.answers
+    );
+
   return {
-    engine: {
-      name:
-        ENGINE_NAME,
+    direction:
+      answers.market_direction?.choice ||
+      "unknown",
 
-      version:
-        ENGINE_VERSION,
+    marketQuality:
+      answers.market_quality?.score ??
+      null,
 
-      model:
-        provider.model
-    },
+    risk:
+      answers.trade_risk?.score ??
+      null,
 
-    request: {
-      requestId:
-        provider.requestId,
+    opportunity:
+      answers.trade_opportunity?.score ??
+      null,
 
-      providerRequestId:
-        provider.providerRequestId
-    },
+    tradeConsiderationProbability:
+      answers.should_consider_trade?.noul ??
+      null,
 
-    position,
+    answers,
 
-    decision:
-      finalDecision,
+    model:
+      providerResult.model ||
+      JEV_MODEL,
 
-    rawDecision:
-      normalized.decision,
-
-    confidence:
-      normalized.confidence,
-
-    probabilities: {
-      bullish:
-        normalized.bullishProbability,
-
-      bearish:
-        normalized.bearishProbability
-    },
-
-    evidence:
-      normalized.evidence,
-
-    reason:
-      normalized.reason,
-
-    consistency,
+    provider:
+      providerResult.provider ||
+      null,
 
     usage:
-      provider.usage,
-
-    safety: {
-      executionApproved:
-        false,
-
-      executionAllowed:
-        false,
-
-      paperTrading:
-        true,
-
-      liveTrading:
-        false,
-
-      walletAccess:
-        false,
-
-      privateKeysAvailable:
-        false,
-
-      withdrawalsEnabled:
-        false,
-
-      riskOverrideAllowed:
-        false
-    },
-
-    execution: {
-      allowed:
-        false,
-
-      executed:
-        false
-    },
-
-    timestamp:
-      new Date().toISOString()
+      providerResult.usage ||
+      null
   };
 }
 
 
-// --------------------------------------------------
-// Engine status
-// --------------------------------------------------
+// =========================================================
+// TRADE RESULT
+// =========================================================
 
-function getJevEngineStatus() {
+function buildTradeResult(providerResult) {
+  const answers =
+    normalizeAnswers(
+      providerResult.answers
+    );
+
+  return {
+    direction:
+      answers.trade_direction?.choice ||
+      "flat",
+
+    setupQuality:
+      answers.setup_quality?.score ??
+      null,
+
+    risk:
+      answers.risk_level?.score ??
+      null,
+
+    approvalProbability:
+      answers.approve_trade?.noul ??
+      null,
+
+    answers,
+
+    model:
+      providerResult.model ||
+      JEV_MODEL,
+
+    provider:
+      providerResult.provider ||
+      null,
+
+    usage:
+      providerResult.usage ||
+      null
+  };
+}
+
+
+// =========================================================
+// MARKET EVALUATION
+// =========================================================
+
+export async function evaluateMarketState(
+  marketData
+) {
+  if (!isNonEmptyObject(marketData)) {
+    throw new Error(
+      "Invalid market data: expected a non-empty object"
+    );
+  }
+
+  const requestId =
+    createRequestId();
+
+  const providerResult =
+    await requestJev(
+      marketData,
+      getMarketQuestions(),
+      requestId
+    );
+
+  return {
+    ok: true,
+
+    operation:
+      "market-evaluation",
+
+    requestId,
+
+    result:
+      buildMarketResult(
+        providerResult
+      ),
+
+    safety:
+      SAFETY_POLICY
+  };
+}
+
+
+// =========================================================
+// TRADE EVALUATION
+// =========================================================
+
+export async function evaluateTrade(
+  state,
+  options = {}
+) {
+  if (!isNonEmptyObject(state)) {
+    throw new Error(
+      "Invalid trade state: expected a non-empty object"
+    );
+  }
+
+  if (!isObject(options)) {
+    throw new Error(
+      "Invalid trade options: expected an object"
+    );
+  }
+
+  const requestId =
+    createRequestId();
+
+  const combinedState = {
+    state,
+    options
+  };
+
+  const providerResult =
+    await requestJev(
+      combinedState,
+      getTradeQuestions(),
+      requestId
+    );
+
+  return {
+    ok: true,
+
+    operation:
+      "trade-evaluation",
+
+    requestId,
+
+    result:
+      buildTradeResult(
+        providerResult
+      ),
+
+    safety:
+      SAFETY_POLICY
+  };
+}
+
+
+// =========================================================
+// ENGINE STATUS
+// =========================================================
+
+export function getEngineStatus() {
   return {
     ok: true,
 
     engine:
-      ENGINE_NAME,
+      "Jev Engine",
 
     version:
-      ENGINE_VERSION,
+      "5.0.0",
+
+    provider:
+      "OpenRouter",
 
     model:
       JEV_MODEL,
@@ -901,79 +768,30 @@ function getJevEngineStatus() {
     endpoint:
       OPENROUTER_URL,
 
-    apiKeyConfigured:
-      Boolean(
-        process.env.OPENROUTER_API_KEY
-      ),
+    mode:
+      "evaluation-only",
 
-    execution: {
-      paper:
-        true,
+    configured:
+      Boolean(OPENROUTER_API_KEY),
 
-      live:
-        false,
+    timeoutMs:
+      TIMEOUT_MS,
 
-      executor:
-        false
-    },
+    maxRetries:
+      MAX_RETRIES,
 
-    security: {
-      walletAccess:
-        false,
-
-      privateKeys:
-        false,
-
-      withdrawals:
-        false
-    }
+    safety:
+      SAFETY_POLICY
   };
 }
 
 
-// --------------------------------------------------
-// Questions / capabilities
-// --------------------------------------------------
-
-function getJevQuestions() {
-  return {
-    decisions: [
-      "LONG",
-      "SHORT",
-      "HOLD",
-      "REDUCE",
-      "EXIT",
-      "WAIT"
-    ],
-
-    evidence: [
-      "sufficient",
-      "bullishStructure",
-      "bearishStructure",
-      "accumulation",
-      "reversalRisk",
-      "thesisInvalidated",
-      "riskCompatible"
-    ],
-
-    execution:
-      false
-  };
-}
-
-
-// --------------------------------------------------
-// Exports
-// --------------------------------------------------
-
-export {
-  evaluateMarketState,
-  getJevEngineStatus,
-  getJevQuestions
-};
+// =========================================================
+// EXPORT
+// =========================================================
 
 export default {
   evaluateMarketState,
-  getJevEngineStatus,
-  getJevQuestions
+  evaluateTrade,
+  getEngineStatus
 };
