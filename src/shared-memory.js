@@ -1,11 +1,12 @@
 // shared-memory.js
-// Jev Shared Memory V3.0.0
+// Jev Shared Memory V3.1.0
 //
 // Purpose:
 // - Persistent Jev memory using Upstash Redis REST
 // - Safe local fallback if Redis is unavailable
 // - Search and recent-memory retrieval
 // - Memory statistics and connection status
+// - Robust memory-content normalization
 // - Compatible with Jev Connector API
 //
 // Environment variables:
@@ -44,32 +45,90 @@ function now() {
   return new Date().toISOString();
 }
 
+/**
+ * Extract memory content from many compatible input formats.
+ */
+function extractContent(input) {
+  if (typeof input === "string") {
+    return input;
+  }
+
+  if (!input || typeof input !== "object") {
+    return "";
+  }
+
+  const candidates = [
+    input.content,
+    input.text,
+    input.message,
+    input.value,
+    input.memory,
+    input.note,
+    input.information,
+    input.data,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+
+    if (
+      candidate !== null &&
+      candidate !== undefined &&
+      typeof candidate !== "string"
+    ) {
+      try {
+        const serialized = JSON.stringify(candidate);
+
+        if (serialized && serialized !== "{}" && serialized !== "null") {
+          return serialized;
+        }
+      } catch {
+        // Continue checking other fields.
+      }
+    }
+  }
+
+  return "";
+}
+
+/**
+ * Normalize any supported memory input.
+ */
 function normalizeMemory(input = {}) {
+  const content = extractContent(input);
+
   if (typeof input === "string") {
     return {
       id: makeId(),
       createdAt: now(),
-      content: input,
+      content,
       type: "text",
       tags: [],
+      source: "jev",
+      metadata: {},
     };
   }
 
+  const safeInput =
+    input && typeof input === "object"
+      ? input
+      : {};
+
   return {
-    id: input.id || makeId(),
-    createdAt: input.createdAt || now(),
-    type: input.type || "memory",
-    content:
-      input.content ??
-      input.text ??
-      input.message ??
-      input.value ??
-      "",
-    tags: Array.isArray(input.tags) ? input.tags : [],
-    source: input.source || "jev",
+    id: safeInput.id || makeId(),
+    createdAt: safeInput.createdAt || now(),
+    type: safeInput.type || "memory",
+    content,
+    tags: Array.isArray(safeInput.tags)
+      ? safeInput.tags
+      : [],
+    source: safeInput.source || "jev",
     metadata:
-      input.metadata && typeof input.metadata === "object"
-        ? input.metadata
+      safeInput.metadata &&
+      typeof safeInput.metadata === "object"
+        ? safeInput.metadata
         : {},
   };
 }
@@ -90,8 +149,11 @@ async function redisCommand(command) {
 
   if (!response.ok) {
     const body = await response.text().catch(() => "");
+
     throw new Error(
-      `Upstash Redis HTTP ${response.status}${body ? `: ${body}` : ""}`
+      `Upstash Redis HTTP ${response.status}${
+        body ? `: ${body}` : ""
+      }`
     );
   }
 
@@ -113,11 +175,27 @@ async function pingRedis() {
  */
 export async function saveSharedMemory(input) {
   const memory = normalizeMemory(input);
+
+  // Do not silently save an empty memory.
+  if (!memory.content || !String(memory.content).trim()) {
+    return {
+      ok: false,
+      persistent: false,
+      error: "Memory content is empty",
+      memory: null,
+    };
+  }
+
   const encoded = JSON.stringify(memory);
 
   if (isConfigured()) {
     try {
-      await redisCommand(["LPUSH", MEMORY_KEY, encoded]);
+      await redisCommand([
+        "LPUSH",
+        MEMORY_KEY,
+        encoded,
+      ]);
+
       await redisCommand([
         "LTRIM",
         MEMORY_KEY,
@@ -128,7 +206,11 @@ export async function saveSharedMemory(input) {
       lastError = null;
       lastConnectionCheck = now();
 
-      const count = await redisCommand(["LLEN", MEMORY_KEY]);
+      const count = await redisCommand([
+        "LLEN",
+        MEMORY_KEY,
+      ]);
+
       lastKnownCount = Number(count) || 0;
 
       return {
@@ -201,7 +283,7 @@ export async function getRecentMemories(limit = 20) {
 }
 
 /**
- * Get all available memory records for internal operations.
+ * Get all available memory records.
  */
 async function getAllMemories() {
   if (isConfigured()) {
@@ -240,8 +322,13 @@ async function getAllMemories() {
 /**
  * Search memories.
  */
-export async function searchSharedMemory(query, options = {}) {
-  const text = String(query || "").trim().toLowerCase();
+export async function searchSharedMemory(
+  query,
+  options = {}
+) {
+  const text = String(query || "")
+    .trim()
+    .toLowerCase();
 
   if (!text) {
     return [];
@@ -265,7 +352,9 @@ export async function searchSharedMemory(query, options = {}) {
         memory.content,
         memory.type,
         memory.source,
-        ...(Array.isArray(memory.tags) ? memory.tags : []),
+        ...(Array.isArray(memory.tags)
+          ? memory.tags
+          : []),
         JSON.stringify(memory.metadata || {}),
       ]
         .join(" ")
@@ -306,16 +395,24 @@ export async function searchSharedMemory(query, options = {}) {
  * Compatibility helper.
  */
 export async function getSharedMemory(options = {}) {
-  return await getRecentMemories(options.limit || 20);
+  return await getRecentMemories(
+    options.limit || 20
+  );
 }
 
 /**
  * Build memory context for Jev.
  */
-export async function buildJevMemoryContext(query, options = {}) {
-  const memories = await searchSharedMemory(query, {
-    limit: options.limit || 10,
-  });
+export async function buildJevMemoryContext(
+  query,
+  options = {}
+) {
+  const memories = await searchSharedMemory(
+    query,
+    {
+      limit: options.limit || 10,
+    }
+  );
 
   if (!memories.length) {
     return "";
@@ -353,7 +450,10 @@ export async function getJevMemorySnapshot() {
 export async function getSharedMemoryStats() {
   if (isConfigured()) {
     try {
-      const count = await redisCommand(["LLEN", MEMORY_KEY]);
+      const count = await redisCommand([
+        "LLEN",
+        MEMORY_KEY,
+      ]);
 
       lastKnownCount = Number(count) || 0;
       lastError = null;
@@ -409,7 +509,10 @@ export async function checkSharedMemoryConnection() {
   try {
     const result = await pingRedis();
 
-    const count = await redisCommand(["LLEN", MEMORY_KEY]);
+    const count = await redisCommand([
+      "LLEN",
+      MEMORY_KEY,
+    ]);
 
     lastConnectionCheck = checkedAt;
     lastError = null;
@@ -447,7 +550,8 @@ export async function checkSharedMemoryConnection() {
  * Get current memory status.
  */
 export async function getSharedMemoryStatus() {
-  const connection = await checkSharedMemoryConnection();
+  const connection =
+    await checkSharedMemoryConnection();
 
   return {
     configured: connection.configured,
@@ -455,9 +559,16 @@ export async function getSharedMemoryStatus() {
     mode: connection.mode,
     readOnly: connection.readOnly,
     lastConnectionCheck:
-      lastConnectionCheck || connection.checkedAt || null,
-    lastError: lastError || connection.error || null,
-    memoryCount: connection.memoryCount ?? lastKnownCount,
+      lastConnectionCheck ||
+      connection.checkedAt ||
+      null,
+    lastError:
+      lastError ||
+      connection.error ||
+      null,
+    memoryCount:
+      connection.memoryCount ??
+      lastKnownCount,
   };
 }
 
